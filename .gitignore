@@ -1,0 +1,5 @@
+build/
+bin/
+*.user
+__pycache__/
+*.pyc
