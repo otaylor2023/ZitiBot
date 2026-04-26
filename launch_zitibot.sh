@@ -117,13 +117,18 @@ else
 	echo ""
 fi
 
-echo "Starting controller (Ctrl+C here stops both; Q in the sim window quits visualizer and this script)..."
+echo "Starting controller (Ctrl+C or 'q' here stops both; Q in sim window also exits)..."
 "${CTRL}" &
 CTRL_PID=$!
 
 # Exit when either process dies (e.g. Q in sim closes visualizer → we stop controller and the script ends).
 while kill -0 "${SIMVIZ_PID}" 2>/dev/null && kill -0 "${CTRL_PID}" 2>/dev/null; do
-	sleep 0.15
+	if IFS= read -r -n1 -t 1 key; then
+		if [[ "${key}" == "q" || "${key}" == "Q" ]]; then
+			echo "Terminal quit key pressed; stopping controller and visualizer." >&2
+			break
+		fi
+	fi
 done
 if ! kill -0 "${SIMVIZ_PID}" 2>/dev/null && kill -0 "${CTRL_PID}" 2>/dev/null; then
 	echo "Visualizer exited (e.g. Q); stopping controller." >&2

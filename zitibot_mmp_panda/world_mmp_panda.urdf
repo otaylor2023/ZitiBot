@@ -11,7 +11,7 @@
 	    <visual>
 	        <origin xyz="0.0 0.0 -0.00635" rpy="0 0 0" />
 	        <geometry>
-				<box size="5 5 0.0127" />
+				<box size="7 7 0.0127" />
 	        </geometry>
 	        <material name="material">
 		        <color rgba="0.1 0.1 0.1 1.0" />
@@ -20,13 +20,191 @@
 		<collision>
 	        <origin xyz="0.0 0.0 -0.00635" rpy="0 0 0" />
 	        <geometry>
-	            <box size="5 5 0.0127" />
+	            <box size="7 7 0.0127" />
+	        </geometry>
+	    </collision>
+	</static_object>
+
+	<!-- Simple kitchen blockout: fridge + back counters/stove + island + sink -->
+	<static_object name="fridge">
+		<!-- Aligned flush with the far end of the right corner run -->
+		<origin xyz="3.15 1.31 0.0" rpy="0 0 0" />
+	    <visual>
+	        <origin xyz="0.0 0.0 0.40" rpy="0 0 0" />
+	        <geometry>
+				<box size="0.75 0.72 1.80" />
+	        </geometry>
+	        <material name="fridge_gray">
+		        <color rgba="0.65 0.67 0.70 1.0" />
+	        </material>
+	    </visual>
+		<collision>
+	        <origin xyz="0.0 0.0 0.40" rpy="0 0 0" />
+	        <geometry>
+	            <box size="0.75 0.72 1.80" />
+	        </geometry>
+	    </collision>
+	</static_object>
+
+	<static_object name="counter_back_left">
+		<!-- Left counter now touches the stove -->
+		<origin xyz="-0.3 -0.9 0.0" rpy="0 0 0" />
+	    <visual>
+	        <origin xyz="0.0 0.0 0.1072" rpy="0 0 0" />
+	        <geometry>
+				<box size="1.4 0.7 0.9144" />
+	        </geometry>
+	        <material name="counter_white">
+		        <color rgba="0.95 0.95 0.95 1.0" />
+	        </material>
+	    </visual>
+		<collision>
+	        <origin xyz="0.0 0.0 0.1072" rpy="0 0 0" />
+	        <geometry>
+	            <box size="1.4 0.7 0.9144" />
+	        </geometry>
+	    </collision>
+	</static_object>
+
+	<static_object name="stove">
+		<origin xyz="0.8 -0.9 0.0" rpy="0 0 0" />
+	    <visual>
+	        <origin xyz="0.0 0.0 0.1072" rpy="0 0 0" />
+	        <geometry>
+				<box size="0.8 0.7 0.9144" />
+	        </geometry>
+	        <material name="stove_black">
+		        <color rgba="0.05 0.05 0.05 1.0" />
+	        </material>
+	    </visual>
+		<collision>
+	        <origin xyz="0.0 0.0 0.1072" rpy="0 0 0" />
+	        <geometry>
+	            <box size="0.8 0.7 0.9144" />
+	        </geometry>
+	    </collision>
+	</static_object>
+
+	<static_object name="counter_back_right">
+		<!-- Flush with stove edge (no overlap) -->
+		<origin xyz="2.0 -0.9 0.0" rpy="0 0 0" />
+	    <visual>
+	        <origin xyz="0.0 0.0 0.1072" rpy="0 0 0" />
+	        <geometry>
+				<box size="1.6 0.7 0.9144" />
+	        </geometry>
+	        <material name="counter_white">
+		        <color rgba="0.95 0.95 0.95 1.0" />
+	        </material>
+	    </visual>
+		<collision>
+	        <origin xyz="0.0 0.0 0.1072" rpy="0 0 0" />
+	        <geometry>
+	            <box size="1.6 0.7 0.9144" />
+	        </geometry>
+	    </collision>
+	</static_object>
+
+	<static_object name="counter_back_right_corner">
+		<!-- Corner return on the fridge side, extending toward the front -->
+		<origin xyz="3.15 -0.15 0.0" rpy="0 0 0" />
+	    <visual>
+	        <origin xyz="0.0 0.0 0.1072" rpy="0 0 0" />
+	        <geometry>
+				<box size="0.70 2.20 0.9144" />
+	        </geometry>
+	        <material name="counter_white">
+		        <color rgba="0.95 0.95 0.95 1.0" />
+	        </material>
+	    </visual>
+		<collision>
+	        <origin xyz="0.0 0.0 0.1072" rpy="0 0 0" />
+	        <geometry>
+	            <box size="0.70 2.20 0.9144" />
+	        </geometry>
+	    </collision>
+	</static_object>
+
+	<static_object name="dishwasher">
+		<!-- Replaces old fridge location: gray counter-height appliance -->
+		<origin xyz="-1.32 -0.9 0.0" rpy="0 0 0" />
+	    <visual>
+	        <origin xyz="0.0 0.0 0.1072" rpy="0 0 0" />
+	        <geometry>
+				<box size="0.64 0.70 0.9144" />
+	        </geometry>
+	        <material name="dishwasher_gray">
+		        <color rgba="0.55 0.57 0.60 1.0" />
+	        </material>
+	    </visual>
+		<collision>
+	        <origin xyz="0.0 0.0 0.1072" rpy="0 0 0" />
+	        <geometry>
+	            <box size="0.64 0.70 0.9144" />
+	        </geometry>
+	    </collision>
+	</static_object>
+
+	<static_object name="island">
+		<origin xyz="0.7 0.9 0.0" rpy="0 0 0" />
+	    <visual>
+	        <origin xyz="0.0 0.0 0.1072" rpy="0 0 0" />
+	        <geometry>
+				<box size="1.8 0.9 0.9144" />
+	        </geometry>
+	        <material name="island_white">
+		        <color rgba="0.98 0.98 0.98 1.0" />
+	        </material>
+	    </visual>
+		<collision>
+	        <origin xyz="0.0 0.0 0.1072" rpy="0 0 0" />
+	        <geometry>
+	            <box size="1.8 0.9 0.9144" />
+	        </geometry>
+	    </collision>
+	</static_object>
+
+	<static_object name="sink_basin">
+		<origin xyz="1.35 0.66 0.0" rpy="0 0 0" />
+	    <visual>
+	        <origin xyz="0.0 0.0 0.5634" rpy="0 0 0" />
+	        <geometry>
+				<box size="0.40 0.30 0.06" />
+	        </geometry>
+	        <material name="sink_dark">
+		        <color rgba="0.20 0.20 0.22 1.0" />
+	        </material>
+	    </visual>
+		<collision>
+	        <origin xyz="0.0 0.0 0.5634" rpy="0 0 0" />
+	        <geometry>
+	            <box size="0.40 0.30 0.06" />
+	        </geometry>
+	    </collision>
+	</static_object>
+
+	<static_object name="sink_faucet">
+		<origin xyz="1.50 0.66 0.0" rpy="0 0 0" />
+	    <visual>
+	        <origin xyz="0.0 0.0 0.6372" rpy="0 0 0" />
+	        <geometry>
+				<cylinder length="0.22" radius="0.015" />
+	        </geometry>
+	        <material name="faucet_gray">
+		        <color rgba="0.70 0.70 0.72 1.0" />
+	        </material>
+	    </visual>
+		<collision>
+	        <origin xyz="0.0 0.0 0.6372" rpy="0 0 0" />
+	        <geometry>
+	            <cylinder length="0.22" radius="0.015" />
 	        </geometry>
 	    </collision>
 	</static_object>
 
 	<dynamic_object name="cup">
-		<origin xyz="1.0 0.0 1.0" rpy="0 0 0" />
+		<!-- Cup starts above island so it drops near the sink area -->
+		<origin xyz="0.9 0.9 1.0" rpy="0 0 0" />
 		<inertial>
         	<origin xyz="0 0 0" rpy="0 0 0" />
         	<mass value="10" />
@@ -69,9 +247,9 @@
 	</light>
 
 	<camera name="camera_fixed">
-		<position xyz="2.0 -0.8 1.0" />
+		<position xyz="0.655677 3.83994 3.785" />
 		<vertical xyz="0.0 0.0 1.0" />
-		<lookat xyz="0.0 0.0 0.5" />
+		<lookat xyz="0.700671 3.02258 3.21064" />
 	</camera>
 
 </world>

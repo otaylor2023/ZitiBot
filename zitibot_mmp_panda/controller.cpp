@@ -82,13 +82,13 @@ int main() {
 	auto joint_task = std::make_shared<SaiPrimitives::JointTask>(robot);
 	joint_task->setGains(400, 40, 0);
 
-	VectorXd q_desired(dof);
-	q_desired.tail(7) << -30.0, -15.0, -15.0, -105.0, 0.0, 90.0, 45.0;
-	q_desired.tail(7) *= M_PI / 180.0;
-	q_desired.head(3) << 0, 0, 0;
+	// Hold the current robot state at startup so the platform does not move
+	// until we explicitly command a motion sequence.
+	VectorXd q_desired = robot->q();
 	joint_task->setGoalPosition(q_desired);
 
 	bool arm_driven_control = true;
+	bool start_motion_automatically = false;
 	// bool arm_driven_control = false;
 	if (arm_driven_control) {
 		base_task->setGains(0, 40, 0);
@@ -115,7 +115,7 @@ int main() {
 
 			command_torques = joint_task->computeTorques();
 
-			if ((robot->q() - q_desired).norm() < 1e-2) {
+			if (start_motion_automatically && (robot->q() - q_desired).norm() < 1e-2) {
 				cout << "Posture To Motion" << endl;
 				pose_task->reInitializeTask();
 				base_task->reInitializeTask();
