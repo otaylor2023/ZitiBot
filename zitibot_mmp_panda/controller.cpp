@@ -82,9 +82,29 @@ int main() {
 	auto joint_task = std::make_shared<SaiPrimitives::JointTask>(robot);
 	joint_task->setGains(400, 40, 0);
 
+	// optional gripper task if the loaded model includes finger joints
+	bool has_gripper = (dof >= 12);
+	std::shared_ptr<SaiPrimitives::JointTask> gripper_task = nullptr;
+	Vector2d gripper_opening(0.02, -0.02);
+	if (has_gripper) {
+		MatrixXd gripper_selection_matrix = MatrixXd::Zero(2, dof);
+		gripper_selection_matrix(0, dof - 2) = 1;
+		gripper_selection_matrix(1, dof - 1) = 1;
+		gripper_task = std::make_shared<SaiPrimitives::JointTask>(robot, gripper_selection_matrix);
+		gripper_task->setDynamicDecouplingType(SaiPrimitives::DynamicDecouplingType::IMPEDANCE);
+		double kp_gripper = 5e3;
+		double kv_gripper = 1e2;
+		gripper_task->setGains(kp_gripper, kv_gripper, 0);
+	}
+
 	// Hold the current robot state at startup so the platform does not move
 	// until we explicitly command a motion sequence.
 	VectorXd q_desired = robot->q();
+	if (has_gripper) {
+		q_desired(dof - 2) = gripper_opening(0);
+		q_desired(dof - 1) = gripper_opening(1);
+		gripper_task->setGoalPosition(gripper_opening);
+	}
 	joint_task->setGoalPosition(q_desired);
 
 	bool arm_driven_control = true;
@@ -112,13 +132,23 @@ int main() {
 			// update task model 
 			N_prec.setIdentity();
 			joint_task->updateTaskModel(N_prec);
+			if (has_gripper) {
+				gripper_task->updateTaskModel(joint_task->getTaskAndPreviousNullspace());
+			}
 
 			command_torques = joint_task->computeTorques();
+			if (has_gripper) {
+				command_torques += gripper_task->computeTorques();
+			}
 
 			if (start_motion_automatically && (robot->q() - q_desired).norm() < 1e-2) {
 				cout << "Posture To Motion" << endl;
 				pose_task->reInitializeTask();
 				base_task->reInitializeTask();
+				if (has_gripper) {
+					gripper_task->reInitializeTask();
+					gripper_task->setGoalPosition(gripper_opening);
+				}
 				joint_task->reInitializeTask();
 
 				ee_pos = robot->position(control_link, control_point);
@@ -142,16 +172,29 @@ int main() {
 				N_prec.setIdentity();
 				pose_task->updateTaskModel(N_prec);
 				base_task->updateTaskModel(pose_task->getTaskAndPreviousNullspace());
-				joint_task->updateTaskModel(base_task->getTaskAndPreviousNullspace());
+				if (has_gripper) {
+					gripper_task->updateTaskModel(base_task->getTaskAndPreviousNullspace());
+					joint_task->updateTaskModel(gripper_task->getTaskAndPreviousNullspace());
+				} else {
+					joint_task->updateTaskModel(base_task->getTaskAndPreviousNullspace());
+				}
 			} else {
 				// update task model for base -> arm motion 
 				N_prec.setIdentity();
 				base_task->updateTaskModel(N_prec);
 				pose_task->updateTaskModel(base_task->getTaskAndPreviousNullspace());
-				joint_task->updateTaskModel(pose_task->getTaskAndPreviousNullspace());
+				if (has_gripper) {
+					gripper_task->updateTaskModel(pose_task->getTaskAndPreviousNullspace());
+					joint_task->updateTaskModel(gripper_task->getTaskAndPreviousNullspace());
+				} else {
+					joint_task->updateTaskModel(pose_task->getTaskAndPreviousNullspace());
+				}
 			}
 
 			command_torques = pose_task->computeTorques() + base_task->computeTorques() + joint_task->computeTorques();
+			if (has_gripper) {
+				command_torques += gripper_task->computeTorques();
+			}
 		}
 
 		// execute redis write callback
