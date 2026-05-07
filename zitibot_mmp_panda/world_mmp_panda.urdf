@@ -236,6 +236,29 @@
 	    </collision>
 	</dynamic_object>
 
+	<dynamic_object name="ladle">
+		<!-- Resting on the island surface (island top z ≈ 0.9144) -->
+		<origin xyz="0.5 0.9 0.5827" rpy="0 0 0" />
+		<inertial>
+			<!-- CoM and inertia computed from actual mesh geometry at 0.3 kg -->
+			<origin xyz="0.11176 0.02270 0.03876" rpy="0 0 0" />
+			<mass value="0.3" />
+			<inertia ixx="0.000182" iyy="0.002030" izz="0.002067" ixy="-0.000404" ixz="0.0" iyz="0.0" />
+		</inertial>
+		<visual>
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<geometry>
+				<mesh filename="${CS225A_URDF_FOLDER}/test_objects/meshes/visual/ladle.obj" />
+			</geometry>
+		</visual>
+		<collision>
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<geometry>
+				<mesh filename="${CS225A_URDF_FOLDER}/test_objects/meshes/collision/ladle_collision.obj" />
+			</geometry>
+		</collision>
+	</dynamic_object>
+
 	<light name="light1" type="directional">
 		<position xyz="2.0 2.0 2.0" />
 		<lookat xyz="0.0 0.0 0.0" />

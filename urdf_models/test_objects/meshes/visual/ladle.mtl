@@ -1,0 +1,8 @@
+# ladle material — metallic silver
+newmtl ladle_material
+Ka 0.2 0.2 0.2
+Kd 0.75 0.75 0.78
+Ks 0.9 0.9 0.9
+Ns 80.0
+d 1.0
+illum 2
