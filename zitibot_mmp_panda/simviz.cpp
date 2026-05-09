@@ -42,7 +42,7 @@ static const string robot_name = "mmp_panda";
 static const string camera_name = "camera_fixed";
 
 // dynamic objects information
-const vector<std::string> object_names = {"cup", "ladle"};
+const vector<std::string> object_names = {"cup", "ladle", "tray"};
 vector<Affine3d> object_poses;
 vector<VectorXd> object_velocities;
 const int n_objects = object_names.size();
