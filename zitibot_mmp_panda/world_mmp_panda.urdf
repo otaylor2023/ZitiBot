@@ -259,6 +259,28 @@
 		</collision>
 	</dynamic_object>
 
+	<dynamic_object name="tray">
+    	<!-- Resting on the stove top surface (stove top z ≈ 0.9144) -->
+    	<origin xyz="0.8 -0.9 0.9144" rpy="0 0 0" />
+    	<inertial>
+        	<origin xyz="0 0 0" rpy="0 0 0" />
+        	<mass value="0.8" />
+        	<inertia ixx="0.005" iyy="0.009" izz="0.013" ixy="0" ixz="0" iyz="0" />
+    	</inertial>
+    	<visual>
+        	<origin xyz="0 0 0" rpy="0 0 0" />
+        	<geometry>
+            	<mesh filename="${CS225A_URDF_FOLDER}/test_objects/meshes/visual/tray.obj" />
+       	 	</geometry>
+    	</visual>
+    	<collision>
+        	<origin xyz="0 0 0.02" rpy="0 0 0" />
+        	<geometry>
+            	<box size="0.35 0.25 0.04" />
+        	</geometry>
+    	</collision>
+	</dynamic_object>
+
 	<light name="light1" type="directional">
 		<position xyz="2.0 2.0 2.0" />
 		<lookat xyz="0.0 0.0 0.0" />
