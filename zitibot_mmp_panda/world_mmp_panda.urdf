@@ -260,23 +260,26 @@
 	</dynamic_object>
 
 	<dynamic_object name="tray">
-    	<!-- Resting on the stove top surface (stove top z ≈ 0.9144) -->
-    	<origin xyz="0.8 -0.9 0.9144" rpy="0 0 0" />
+    	<!-- Resting on the island surface next to cup and ladle (island top z ≈ 0.5644) -->
+    	<origin xyz="0.1 0.55 0.6" rpy="0 0 0" />
     	<inertial>
         	<origin xyz="0 0 0" rpy="0 0 0" />
         	<mass value="0.8" />
         	<inertia ixx="0.005" iyy="0.009" izz="0.013" ixy="0" ixz="0" iyz="0" />
     	</inertial>
     	<visual>
-        	<origin xyz="0 0 0" rpy="0 0 0" />
+        	<origin xyz="0 0 0" rpy="1.5708 0 0" />
         	<geometry>
-            	<mesh filename="${CS225A_URDF_FOLDER}/test_objects/meshes/visual/tray.obj" />
+            	<mesh filename="${CS225A_URDF_FOLDER}/test_objects/meshes/visual/tray.obj" scale="0.01 0.01 0.01" />
        	 	</geometry>
+        	<material name="tray_silver">
+        		<color rgba="0.7 0.7 0.75 1.0" />
+        	</material>
     	</visual>
     	<collision>
-        	<origin xyz="0 0 0.02" rpy="0 0 0" />
+        	<origin xyz="0.2286 0.1524 0.03175" rpy="1.5708 0 0" />
         	<geometry>
-            	<box size="0.35 0.25 0.04" />
+            	<box size="0.508 0.3048 0.0635" />
         	</geometry>
     	</collision>
 	</dynamic_object>
