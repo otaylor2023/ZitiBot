@@ -4,6 +4,7 @@
  * 
  */
 
+#include <algorithm>
 #include <math.h>
 #include <signal.h>
 #include <iostream>
@@ -42,13 +43,18 @@ static const string robot_name = "mmp_panda";
 static const string camera_name = "camera_fixed";
 
 // dynamic objects information
-const vector<std::string> object_names = {"cup"};
+const vector<std::string> object_names = {"cup", "empty_bowl"};
+static const int kEmptyBowlObjectIndex = 1;
 vector<Affine3d> object_poses;
 vector<VectorXd> object_velocities;
 const int n_objects = object_names.size();
 
 // simulation thread
 void simulation(std::shared_ptr<SaiSimulation::SaiSimulation> sim);
+
+// Initial mobile base joints for mmp_panda: (0) prismatic X [m], (1) prismatic Y [m],
+// (2) base yaw [rad]. Edit here — must stay within URDF limits (roughly ±2.9 m / rad).
+static const Eigen::Vector3d kInitialBaseJoints(-1.0, 0.0, 0.0);
 
 int main() {
 	SaiModel::URDF_FOLDERS["CS225A_URDF_FOLDER"] = string(CS225A_URDF_FOLDER);
@@ -71,14 +77,26 @@ int main() {
 	// graphics->showLinkFrame(true, robot_name, "link7", 0.15);  // can add frames for different links
 	// graphics->getCamera(camera_name)->setClippingPlanes(0.1, 50);  // set the near and far clipping planes 
 	graphics->addUIForceInteraction(robot_name);
-	cout << "Visualizer: press Q in the graphics window to quit.\n";
+	cout << "Visualizer: press Q to quit; P to print robot state.\n";
 
 	// load robots
 	auto robot = std::make_shared<SaiModel::SaiModel>(robot_file, false);
-	// robot->setQ();
-	// robot->setDq();
 	robot->updateModel();
 	ui_torques = VectorXd::Zero(robot->dof());
+
+	// Seed base pose before sim + Redis (see kInitialBaseJoints above).
+	VectorXd q0 = robot->q();
+	q0.head(3) = kInitialBaseJoints;
+	const double pr_lo = -2.8973;
+	const double pr_hi = 2.9873;
+	const double yaw_lo = -2.8973;
+	const double yaw_hi = 2.8973;
+	q0(0) = std::clamp(q0(0), pr_lo, pr_hi);
+	q0(1) = std::clamp(q0(1), pr_lo, pr_hi);
+	q0(2) = std::clamp(q0(2), yaw_lo, yaw_hi);
+	robot->setQ(q0);
+	robot->setDq(VectorXd::Zero(robot->dof()));
+	robot->updateModel();
 
 	// load simulation world
 	auto sim = std::make_shared<SaiSimulation::SaiSimulation>(world_file, false);
@@ -90,6 +108,11 @@ int main() {
 		object_poses.push_back(sim->getObjectPose(object_names[i]));
 		object_velocities.push_back(sim->getObjectVelocity(object_names[i]));
 	}
+
+	Vector3d bowl_t0 = object_poses[kEmptyBowlObjectIndex].translation();
+	VectorXd bowl_xyz0(3);
+	bowl_xyz0 << bowl_t0.x(), bowl_t0.y(), bowl_t0.z();
+	redis_client.setEigen(BOWL_POSITION_KEY, bowl_xyz0);
 
     // set co-efficient of restition to zero for force control
     sim->setCollisionRestitution(0.0);
@@ -103,16 +126,67 @@ int main() {
 	redis_client.setEigen(JOINT_ANGLES_KEY, robot->q()); 
 	redis_client.setEigen(JOINT_VELOCITIES_KEY, robot->dq()); 
 	redis_client.setEigen(JOINT_TORQUES_COMMANDED_KEY, 0 * robot->q());
+	VectorXd ee_goal_R_I(9);
+	ee_goal_R_I << 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0;
+	redis_client.setEigen(EE_GOAL_POSITION_KEY, VectorXd::Zero(3));
+	redis_client.setEigen(EE_GOAL_ROTATION_KEY, ee_goal_R_I);
+	VectorXd ee_goal_inactive(1);
+	ee_goal_inactive(0) = 0.0;
+	redis_client.setEigen(EE_GOAL_ACTIVE_KEY, ee_goal_inactive);
 
 	// start simulation thread
 	thread sim_thread(simulation, sim);
 
 	// while window is open:
+	bool p_key_was_down = false;
 	while (graphics->isWindowOpen() && fSimulationRunning) {
 		if (graphics->isKeyPressed(GLFW_KEY_Q)) {
 			fSimulationRunning = false;
 			break;
 		}
+		const bool p_down = graphics->isKeyPressed(GLFW_KEY_P);
+		if (p_down && !p_key_was_down) {
+			VectorXd q = redis_client.getEigen(JOINT_ANGLES_KEY);
+			VectorXd dq = redis_client.getEigen(JOINT_VELOCITIES_KEY);
+			robot->setQ(q);
+			robot->setDq(dq);
+			robot->updateModel();
+			const Vector3d ee_in_link(0.0, 0.0, 0.07);
+			const Vector3d x_ee = robot->position("link7", ee_in_link);
+			const Matrix3d R_ee = robot->rotation("link7");
+			cout << "\n--- robot state (P) ---\n";
+			cout << "q  (" << q.size() << "): " << q.transpose() << "\n";
+			cout << "dq (" << dq.size() << "): " << dq.transpose() << "\n";
+			cout << "base (x_m, y_m, yaw_rad): " << q.head<3>().transpose() << "\n";
+			cout << "link7 pos (world, m): " << x_ee.transpose() << "\n";
+			cout << "link7 R (world<-link7):\n" << R_ee << "\n";
+			VectorXd g_act = redis_client.getEigen(EE_GOAL_ACTIVE_KEY);
+			VectorXd g_pos = redis_client.getEigen(EE_GOAL_POSITION_KEY);
+			VectorXd g_Rflat = redis_client.getEigen(EE_GOAL_ROTATION_KEY);
+			cout << "goal EE (pose task, control_point in world):\n";
+			if (g_act.size() == 1 && g_act(0) > 0.5 && g_pos.size() == 3 &&
+				g_Rflat.size() == 9) {
+				Map<const Matrix3d> R_goal(g_Rflat.data());
+				cout << "  active: yes\n";
+				cout << "  pos (m): " << g_pos.transpose() << "\n";
+				cout << "  R (world<-link7):\n" << R_goal << "\n";
+			} else {
+				cout << "  active: no (MOVE_BASE or controller not publishing)\n";
+				if (g_pos.size() == 3) {
+					cout << "  pos (stale, m): " << g_pos.transpose() << "\n";
+				}
+			}
+			{
+				lock_guard<mutex> lock(mutex_update);
+				for (int i = 0; i < n_objects; ++i) {
+					cout << "object \"" << object_names[i] << "\" T (xyz): "
+						 << object_poses[i].translation().transpose() << "\n";
+				}
+			}
+			cout << "---\n" << flush;
+		}
+		p_key_was_down = p_down;
+
         graphics->updateRobotGraphics(robot_name, redis_client.getEigen(JOINT_ANGLES_KEY));
 		{
 			lock_guard<mutex> lock(mutex_update);
@@ -169,6 +243,10 @@ void simulation(std::shared_ptr<SaiSimulation::SaiSimulation> sim) {
 				object_velocities[i] = sim->getObjectVelocity(object_names[i]);
 			}
 		}
+		Vector3d bowl_t = object_poses[kEmptyBowlObjectIndex].translation();
+		VectorXd bowl_xyz(3);
+		bowl_xyz << bowl_t.x(), bowl_t.y(), bowl_t.z();
+		redis_client.setEigen(BOWL_POSITION_KEY, bowl_xyz);
 	}
 	timer.stop();
 	cout << "\nSimulation loop timer stats:\n";
