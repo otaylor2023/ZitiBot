@@ -26,6 +26,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable depth stream (color only).",
     )
+    parser.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=10000,
+        help="Per-frame wait timeout in ms (default 10000).",
+    )
+    parser.add_argument(
+        "--warmup-frames",
+        type=int,
+        default=30,
+        help="Frames to discard before display (lets auto-exposure settle).",
+    )
     return parser.parse_args()
 
 
@@ -90,11 +102,38 @@ def main() -> int:
 
     window_name = "RealSense"
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
-
     show_depth = not args.no_depth
+
+    # Warm up: auto-exposure needs a few frames before output is stable, and
+    # the first frame after pipeline.start() can be slow on USB hubs.
+    print(f"Warming up ({args.warmup_frames} frames)...")
+    for _ in range(args.warmup_frames):
+        try:
+            pipeline.wait_for_frames(args.timeout_ms)
+        except RuntimeError:
+            pass
+
+    consecutive_misses = 0
+    max_consecutive_misses = 10
     try:
         while True:
-            frames = pipeline.wait_for_frames()
+            ok, frames = pipeline.try_wait_for_frames(args.timeout_ms)
+            if not ok:
+                consecutive_misses += 1
+                print(
+                    f"Frame didn't arrive within {args.timeout_ms} ms "
+                    f"(miss {consecutive_misses}/{max_consecutive_misses})."
+                )
+                if consecutive_misses >= max_consecutive_misses:
+                    print(
+                        "Too many consecutive timeouts. Check USB 3 connection, "
+                        "try a different port/cable, or lower --fps / --width / --height.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                continue
+            consecutive_misses = 0
+
             if align is not None:
                 frames = align.process(frames)
 
