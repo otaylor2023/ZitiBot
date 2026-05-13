@@ -1,17 +1,22 @@
-"""Pre/post-processing helpers for GG-CNN2 inference on RealSense depth.
+"""Shared pre/post-processing helpers for heatmap-style grasp models.
+
+Used by both GG-CNN2 (depth-only, 300x300 input) and GR-ConvNet (RGB-D,
+224x224 input). Each predictor builds its own model input tensor, but the
+center-crop, postprocess (gaussian smooth + argmax), heatmap overlay, and
+grasp-rectangle drawing are shared.
 
 Pipeline:
     raw depth (uint16, mm)
         -> meters, in-paint holes
         -> center-crop to a square (crop_size px)
-        -> resize to model input (300x300)
-        -> subtract mean depth, clip to [-1, 1]
-        -> torch tensor (1, 1, 300, 300)
+        -> resize to the model's input size
+        -> per-image normalize
+        -> torch tensor (1, C, H, W)
     model -> (pos, cos, sin, width)
         -> gaussian-smooth pos
-        -> argmax pixel (u_m, v_m) in 300x300
+        -> argmax pixel (u_m, v_m) in model space
         -> theta = atan2(sin, cos) / 2 at that pixel (rad)
-        -> width = width_map * 150 px at that pixel (model scale)
+        -> width = width_map * WIDTH_SCALE_PX at that pixel (model scale)
         -> map (u, v, width) back to full color image coords
 """
 
@@ -25,8 +30,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 
 
-MODEL_INPUT = 300
-WIDTH_SCALE_PX = 150.0  # Upstream GG-CNN(2) clips/normalizes width to 150 px.
+WIDTH_SCALE_PX = 150.0  # Both GG-CNN(2) and GR-ConvNet clip/normalize width to 150 px.
 
 
 @dataclass
@@ -61,14 +65,38 @@ def center_square_crop(img: np.ndarray, size: int | None = None) -> tuple[np.nda
     return img[y0:y0 + side, x0:x0 + side], CropInfo(x0=x0, y0=y0, size=side)
 
 
-def preprocess_depth(depth_m: np.ndarray, crop_size: int | None = None) -> tuple[np.ndarray, CropInfo]:
-    """Depth (meters) -> normalized model input (1, 1, 300, 300) float32."""
+def preprocess_depth(
+    depth_m: np.ndarray,
+    crop_size: int | None = None,
+    model_input: int = 300,
+) -> tuple[np.ndarray, CropInfo]:
+    """Depth (meters) -> normalized depth plane at ``model_input`` square, plus the crop info.
+
+    Returns a float32 ndarray of shape ``(model_input, model_input)``.
+    """
     filled = inpaint_depth(depth_m.astype(np.float32))
     cropped, info = center_square_crop(filled, crop_size)
-    resized = cv2.resize(cropped, (MODEL_INPUT, MODEL_INPUT), interpolation=cv2.INTER_AREA)
-    # GG-CNN training normalization: subtract per-image mean, clip to [-1, 1].
+    resized = cv2.resize(cropped, (model_input, model_input), interpolation=cv2.INTER_AREA)
+    # Per-image normalize: subtract mean, clip to [-1, 1]. Used by both upstreams.
     normed = np.clip(resized - resized.mean(), -1.0, 1.0).astype(np.float32)
-    return normed[None, None, :, :], info
+    return normed, info
+
+
+def preprocess_rgb(
+    color_bgr: np.ndarray,
+    crop: CropInfo,
+    model_input: int = 224,
+) -> np.ndarray:
+    """BGR uint8 -> RGB float32 at ``model_input`` square, normalized to ~[-1, 1].
+
+    Uses the crop chosen by :func:`preprocess_depth` so the two modalities stay aligned.
+    Returns shape ``(3, model_input, model_input)``.
+    """
+    cropped = color_bgr[crop.y0:crop.y0 + crop.size, crop.x0:crop.x0 + crop.size]
+    resized = cv2.resize(cropped, (model_input, model_input), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    rgb = np.clip(rgb - rgb.mean(), -1.0, 1.0)
+    return rgb.transpose(2, 0, 1)  # HWC -> CHW
 
 
 @dataclass
@@ -89,18 +117,20 @@ def postprocess(
     crop: CropInfo,
     gauss_sigma: float = 2.0,
 ) -> tuple[Grasp2D, np.ndarray]:
-    """Convert GG-CNN2 outputs to the best grasp + the smoothed quality map.
+    """Convert raw network outputs to the best grasp + smoothed quality map.
 
-    All input arrays are shape (300, 300). Returns the best grasp mapped back to
-    full-image coords, and the (300x300) smoothed quality map for visualization.
+    Inputs are square ndarrays of identical shape (model space). Returns the best
+    grasp mapped back to full-image coords, and the smoothed Q map (model space)
+    for the heatmap overlay.
     """
     q = gaussian_filter(pos, gauss_sigma)
+    model_input = q.shape[0]
     v_m, u_m = np.unravel_index(int(np.argmax(q)), q.shape)
     theta = float(math.atan2(float(sin[v_m, u_m]), float(cos[v_m, u_m])) / 2.0)
     width_model_px = float(width[v_m, u_m]) * WIDTH_SCALE_PX
 
-    # Map back to the full image: model 300x300 -> crop square -> full frame.
-    scale = crop.size / MODEL_INPUT
+    # Map back to the full image: model H x H -> crop square -> full frame.
+    scale = crop.size / model_input
     u_full = u_m * scale + crop.x0
     v_full = v_m * scale + crop.y0
     width_full = width_model_px * scale
@@ -119,12 +149,16 @@ def postprocess(
 
 def heatmap_overlay(
     color_bgr: np.ndarray,
-    quality_300: np.ndarray,
+    quality_map: np.ndarray,
     crop: CropInfo,
     alpha: float = 0.5,
 ) -> np.ndarray:
-    """Blend a jet-colormapped quality heatmap over the color image (full frame)."""
-    q = quality_300.copy()
+    """Blend a jet-colormapped quality heatmap over the color image (full frame).
+
+    ``quality_map`` is in model space (e.g. 300x300 or 224x224); it gets upsampled
+    to ``crop.size`` and pasted back at the crop location.
+    """
+    q = quality_map.copy()
     q_min, q_max = float(q.min()), float(q.max())
     if q_max > q_min:
         q = (q - q_min) / (q_max - q_min)

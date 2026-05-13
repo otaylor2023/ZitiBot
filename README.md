@@ -68,24 +68,34 @@ python vision/test_camera.py --fps 15       # drop fps if USB bandwidth is tight
 
 `q` or `Esc` to quit.
 
-### GG-CNN2 grasp demo
+### Grasp demo (parallel-jaw / 2-finger gripper)
 
-One-time: fetch the pretrained Cornell weights (~1 MB) from the upstream release.
+`vision/grasp_demo.py` streams the RealSense and, on SPACE, runs a heatmap grasp predictor on the current RGB-D frame. Two pretrained models are bundled, selected with `--model`:
+
+| `--model` | Network | Input | Default size | Source |
+|-----------|---------|-------|--------------|--------|
+| `ggcnn2` (default) | GG-CNN2 (Morrison et al., RSS 2018) | depth only | 300×300 | [dougsm/ggcnn](https://github.com/dougsm/ggcnn) |
+| `grconvnet` | GR-ConvNet v3 (Kumra et al., IROS 2020) | RGB-D | 224×224 | [skumra/robotic-grasping](https://github.com/skumra/robotic-grasping) |
+
+Both are single-pass heatmap networks and run real-time on CPU. GR-ConvNet is heavier and a bit stronger on Cornell; GG-CNN2 is tiny.
+
+One-time: fetch whichever model's pretrained Cornell weights you want.
 
 ```bash
-bash vision/ggcnn/weights/download_weights.sh
+bash vision/ggcnn/weights/download_weights.sh        # ~1 MB
+bash vision/grconvnet/weights/download_weights.sh    # ~30 MB
 ```
 
-Run the live stream + grasp prediction:
+Run:
 
 ```bash
-python vision/grasp_demo.py
+python vision/grasp_demo.py                          # ggcnn2 (default)
+python vision/grasp_demo.py --model grconvnet
+python vision/grasp_demo.py --model grconvnet --crop 400 --fps 15
 ```
 
 Keys:
 
-- **SPACE** -- run GG-CNN2 on the current frame; pop a window with a jet-colormapped quality heatmap and the top antipodal grasp (red = gripper plates, green = opening width).
-- **s** -- save the latched grasp overlay as `grasp_<timestamp>.png` in the cwd.
+- **SPACE** -- run the selected model on the current frame; pop a window with a jet-colormapped quality heatmap and the top antipodal grasp (red = gripper plates, green = opening width).
+- **s** -- save the latched grasp overlay as `grasp_<model>_<timestamp>.png` in the cwd.
 - **q** / **Esc** -- quit.
-
-The model is GG-CNN2 (Morrison et al., RSS 2018), vendored from [dougsm/ggcnn](https://github.com/dougsm/ggcnn) and trained on the Cornell Grasping Dataset. It assumes a parallel-jaw / 2-finger gripper.

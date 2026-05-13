@@ -1,8 +1,14 @@
-"""Live RealSense stream + GG-CNN2 grasp heatmap on demand.
+"""Live RealSense stream + heatmap grasp predictor on demand.
 
-Press SPACE on the preview window to run GG-CNN2 on the current RGB-D frame.
-The "grasp" window shows a jet-colormapped quality heatmap blended over the
-color image, with the top antipodal grasp drawn as a rectangle:
+Two pretrained models are supported, both single-shot heatmap predictors for
+parallel-jaw grippers:
+
+  - ``ggcnn2``   GG-CNN2 (Morrison et al., RSS 2018). Depth-only, 300x300 input.
+  - ``grconvnet`` GR-ConvNet v3 (Kumra et al., IROS 2020). RGB-D, 224x224 input.
+
+Press SPACE on the preview window to run the selected model on the current
+RGB-D frame. The "grasp" window shows a jet-colormapped quality heatmap blended
+over the color image, with the top antipodal grasp drawn as a rectangle:
   - red lines  = gripper plates
   - green lines = opening (gripper width)
 
@@ -12,11 +18,13 @@ Keys:
   q/ESC  quit
 
 Usage:
-  # First time only: download the pretrained Cornell weights.
-  bash vision/ggcnn/weights/download_weights.sh
+  # First time only: download whichever model's weights you want.
+  bash vision/ggcnn/weights/download_weights.sh        # GG-CNN2
+  bash vision/grconvnet/weights/download_weights.sh    # GR-ConvNet
 
-  python vision/grasp_demo.py
-  python vision/grasp_demo.py --no-warmup --width 640 --height 480 --fps 30
+  python vision/grasp_demo.py                    # defaults to ggcnn2
+  python vision/grasp_demo.py --model grconvnet
+  python vision/grasp_demo.py --model grconvnet --crop 400
 """
 
 from __future__ import annotations
@@ -32,35 +40,40 @@ import numpy as np
 import pyrealsense2 as rs
 import torch
 
-# Make the sibling 'ggcnn' package importable when running this file directly
-# from the repo root, e.g. `python vision/grasp_demo.py`.
+# Make the sibling packages ('ggcnn', 'grconvnet', shared utils) importable when
+# running this file directly from the repo root, e.g. `python vision/grasp_demo.py`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ggcnn import GGCNN2  # noqa: E402
-from ggcnn.grasp_utils import (  # noqa: E402
+from grasp_utils import (  # noqa: E402
     Grasp2D,
     draw_grasp_rect,
     heatmap_overlay,
-    postprocess,
-    preprocess_depth,
 )
-
-
-DEFAULT_WEIGHTS = (
-    Path(__file__).resolve().parent / "ggcnn" / "weights" / "ggcnn2_cornell_statedict.pt"
+from predictors import (  # noqa: E402
+    GraspPrediction,
+    Predictor,
+    available_models,
+    default_weights,
+    make_predictor,
 )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="RealSense + GG-CNN2 grasp demo.")
+    parser = argparse.ArgumentParser(description="RealSense + grasp-heatmap demo.")
+    parser.add_argument(
+        "--model",
+        choices=available_models(),
+        default="ggcnn2",
+        help="Which grasp model to use.",
+    )
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument(
         "--weights",
         type=Path,
-        default=DEFAULT_WEIGHTS,
-        help="Path to GG-CNN2 state_dict (.pt).",
+        default=None,
+        help="Override the default weights path for the chosen model.",
     )
     parser.add_argument(
         "--crop",
@@ -95,46 +108,17 @@ def pick_device(arg: str) -> torch.device:
     return torch.device(arg)
 
 
-def load_model(weights_path: Path, device: torch.device) -> GGCNN2:
-    if not weights_path.is_file():
-        raise FileNotFoundError(
-            f"GG-CNN2 weights not found at {weights_path}. "
-            "Run vision/ggcnn/weights/download_weights.sh first."
-        )
-    state = torch.load(weights_path, map_location=device, weights_only=True)
-    model = GGCNN2()
-    model.load_state_dict(state)
-    model.to(device).eval()
-    return model
-
-
-@torch.no_grad()
-def run_inference(
-    model: GGCNN2, depth_m: np.ndarray, device: torch.device, crop_size: int | None
-) -> tuple[Grasp2D, np.ndarray, "CropInfo"]:  # noqa: F821 - forward ref
-    from ggcnn.grasp_utils import CropInfo  # local import to avoid top-level dep
-
-    net_input, crop = preprocess_depth(depth_m, crop_size=crop_size)
-    x = torch.from_numpy(net_input).to(device)
-    pos, cos, sin, width = model(x)
-    pos = pos.squeeze().cpu().numpy()
-    cos = cos.squeeze().cpu().numpy()
-    sin = sin.squeeze().cpu().numpy()
-    width = width.squeeze().cpu().numpy()
-    grasp, q_map = postprocess(pos, cos, sin, width, crop)
-    return grasp, q_map, crop
-
-
 def build_grasp_view(
     color_bgr: np.ndarray,
     grasp: Grasp2D,
     q_map: np.ndarray,
     crop,
+    model_name: str,
 ) -> np.ndarray:
     view = heatmap_overlay(color_bgr, q_map, crop, alpha=0.45)
     draw_grasp_rect(view, grasp)
     label = (
-        f"q={grasp.quality:.2f} "
+        f"[{model_name}] q={grasp.quality:.2f} "
         f"theta={math.degrees(grasp.theta):+.0f}deg "
         f"w={grasp.width_px:.0f}px"
     )
@@ -163,16 +147,29 @@ def start_pipeline(args: argparse.Namespace) -> tuple[rs.pipeline, rs.align, flo
     return pipeline, align, depth_scale
 
 
+def run_inference(
+    predictor: Predictor,
+    color_bgr: np.ndarray,
+    depth_m: np.ndarray,
+    crop_size: int | None,
+) -> tuple[GraspPrediction, float]:
+    t0 = time.perf_counter()
+    pred = predictor.predict(color_bgr, depth_m, crop_size=crop_size)
+    return pred, (time.perf_counter() - t0) * 1000.0
+
+
 def main() -> int:
     args = parse_args()
 
     device = pick_device(args.device)
-    print(f"Loading GG-CNN2 on {device}...")
-    model = load_model(args.weights, device)
+    weights = args.weights or default_weights(args.model)
+    print(f"Loading {args.model} on {device} (weights: {weights})...")
+    predictor = make_predictor(args.model, args.weights, device)
 
     pipeline, align, depth_scale = start_pipeline(args)
 
-    live_win, grasp_win = "RealSense (live)", "RealSense + GG-CNN2 (grasp)"
+    live_win = "RealSense (live)"
+    grasp_win = f"RealSense + {args.model} (grasp)"
     cv2.namedWindow(live_win, cv2.WINDOW_AUTOSIZE)
 
     latched_view: np.ndarray | None = None
@@ -213,23 +210,24 @@ def main() -> int:
 
             if key == ord(" "):
                 depth_m = np.asanyarray(depth_frame.get_data()).astype(np.float32) * depth_scale
-                t0 = time.perf_counter()
-                grasp, q_map, crop = run_inference(model, depth_m, device, args.crop)
-                dt_ms = (time.perf_counter() - t0) * 1000.0
+                pred, dt_ms = run_inference(predictor, color_bgr, depth_m, args.crop)
+                g = pred.grasp
                 print(
-                    f"grasp: u={grasp.u:.0f} v={grasp.v:.0f} "
-                    f"theta={math.degrees(grasp.theta):+.1f}deg "
-                    f"width={grasp.width_px:.0f}px q={grasp.quality:.3f} "
+                    f"[{args.model}] grasp: u={g.u:.0f} v={g.v:.0f} "
+                    f"theta={math.degrees(g.theta):+.1f}deg "
+                    f"width={g.width_px:.0f}px q={g.quality:.3f} "
                     f"({dt_ms:.1f} ms)"
                 )
-                latched_view = build_grasp_view(color_bgr, grasp, q_map, crop)
+                latched_view = build_grasp_view(
+                    color_bgr, g, pred.quality_map, pred.crop, args.model
+                )
                 cv2.imshow(grasp_win, latched_view)
 
             elif key == ord("s"):
                 if latched_view is None:
                     print("Nothing to save yet -- press SPACE first.")
                 else:
-                    fname = f"grasp_{time.strftime('%Y%m%d_%H%M%S')}.png"
+                    fname = f"grasp_{args.model}_{time.strftime('%Y%m%d_%H%M%S')}.png"
                     cv2.imwrite(fname, latched_view)
                     print(f"Saved {fname}")
     finally:
