@@ -3,3 +3,7 @@ bin/
 *.user
 __pycache__/
 *.pyc
+.env
+.env.*
+!.env.example
+.env

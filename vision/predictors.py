@@ -45,6 +45,8 @@ class Predictor(Protocol):
         color_bgr: np.ndarray,
         depth_m: np.ndarray,
         crop_size: int | None = None,
+        bottom_exclude_px: int = 0,
+        top_exclude_px: int = 0,
     ) -> GraspPrediction: ...
 
 
@@ -82,8 +84,16 @@ class GGCNN2Predictor:
         color_bgr: np.ndarray,
         depth_m: np.ndarray,
         crop_size: int | None = None,
+        bottom_exclude_px: int = 0,
+        top_exclude_px: int = 0,
     ) -> GraspPrediction:
-        depth_plane, crop = preprocess_depth(depth_m, crop_size=crop_size, model_input=self.input_size)
+        depth_plane, crop = preprocess_depth(
+            depth_m,
+            crop_size=crop_size,
+            model_input=self.input_size,
+            bottom_exclude_px=bottom_exclude_px,
+            top_exclude_px=top_exclude_px,
+        )
         x = torch.from_numpy(depth_plane[None, None, :, :]).to(self.device)
         pos, cos, sin, width = self.model(x)
         grasp, q_map = postprocess(
@@ -131,8 +141,16 @@ class GRConvNetPredictor:
         color_bgr: np.ndarray,
         depth_m: np.ndarray,
         crop_size: int | None = None,
+        bottom_exclude_px: int = 0,
+        top_exclude_px: int = 0,
     ) -> GraspPrediction:
-        depth_plane, crop = preprocess_depth(depth_m, crop_size=crop_size, model_input=self.input_size)
+        depth_plane, crop = preprocess_depth(
+            depth_m,
+            crop_size=crop_size,
+            model_input=self.input_size,
+            bottom_exclude_px=bottom_exclude_px,
+            top_exclude_px=top_exclude_px,
+        )
         rgb_planes = preprocess_rgb(color_bgr, crop, model_input=self.input_size)
         # Upstream channel order: [depth, R, G, B].
         rgbd = np.concatenate([depth_plane[None, :, :], rgb_planes], axis=0).astype(np.float32)

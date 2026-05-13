@@ -82,6 +82,22 @@ def parse_args() -> argparse.Namespace:
         help="Square crop size in source pixels (defaults to the short side).",
     )
     parser.add_argument(
+        "--exclude-bottom-frac",
+        type=float,
+        default=0.15,
+        help=(
+            "Fraction of the bottom of the source frame to hide from the model "
+            "(useful to mask out a wrist-mounted gripper). 0 = disabled. "
+            "Default 0.15 (15%% of the height)."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-top-frac",
+        type=float,
+        default=0.0,
+        help="Fraction of the top of the source frame to hide from the model.",
+    )
+    parser.add_argument(
         "--timeout-ms",
         type=int,
         default=10000,
@@ -152,10 +168,35 @@ def run_inference(
     color_bgr: np.ndarray,
     depth_m: np.ndarray,
     crop_size: int | None,
+    bottom_exclude_px: int,
+    top_exclude_px: int,
 ) -> tuple[GraspPrediction, float]:
     t0 = time.perf_counter()
-    pred = predictor.predict(color_bgr, depth_m, crop_size=crop_size)
+    pred = predictor.predict(
+        color_bgr,
+        depth_m,
+        crop_size=crop_size,
+        bottom_exclude_px=bottom_exclude_px,
+        top_exclude_px=top_exclude_px,
+    )
     return pred, (time.perf_counter() - t0) * 1000.0
+
+
+def annotate_excluded_bands(
+    img: np.ndarray, bottom_exclude_px: int, top_exclude_px: int
+) -> np.ndarray:
+    """Dim the excluded regions on the live preview so it's obvious what the model sees."""
+    if bottom_exclude_px <= 0 and top_exclude_px <= 0:
+        return img
+    out = img.copy()
+    h = out.shape[0]
+    if top_exclude_px > 0:
+        roi = out[0:top_exclude_px]
+        out[0:top_exclude_px] = (roi.astype(np.uint16) * 1 // 3).astype(np.uint8)
+    if bottom_exclude_px > 0:
+        roi = out[h - bottom_exclude_px:h]
+        out[h - bottom_exclude_px:h] = (roi.astype(np.uint16) * 1 // 3).astype(np.uint8)
+    return out
 
 
 def main() -> int:
@@ -165,6 +206,14 @@ def main() -> int:
     weights = args.weights or default_weights(args.model)
     print(f"Loading {args.model} on {device} (weights: {weights})...")
     predictor = make_predictor(args.model, args.weights, device)
+
+    bottom_exclude_px = max(0, int(round(args.height * args.exclude_bottom_frac)))
+    top_exclude_px = max(0, int(round(args.height * args.exclude_top_frac)))
+    if bottom_exclude_px or top_exclude_px:
+        print(
+            f"Masking frame: top {top_exclude_px}px, bottom {bottom_exclude_px}px "
+            f"(of {args.height}px height) will be hidden from the model."
+        )
 
     pipeline, align, depth_scale = start_pipeline(args)
 
@@ -202,7 +251,10 @@ def main() -> int:
                 continue
 
             color_bgr = np.asanyarray(color_frame.get_data())
-            cv2.imshow(live_win, color_bgr)
+            cv2.imshow(
+                live_win,
+                annotate_excluded_bands(color_bgr, bottom_exclude_px, top_exclude_px),
+            )
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
@@ -210,7 +262,14 @@ def main() -> int:
 
             if key == ord(" "):
                 depth_m = np.asanyarray(depth_frame.get_data()).astype(np.float32) * depth_scale
-                pred, dt_ms = run_inference(predictor, color_bgr, depth_m, args.crop)
+                pred, dt_ms = run_inference(
+                    predictor,
+                    color_bgr,
+                    depth_m,
+                    args.crop,
+                    bottom_exclude_px,
+                    top_exclude_px,
+                )
                 g = pred.grasp
                 print(
                     f"[{args.model}] grasp: u={g.u:.0f} v={g.v:.0f} "

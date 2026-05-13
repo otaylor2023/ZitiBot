@@ -4,3 +4,5 @@ pyrealsense2>=2.54
 scipy>=1.11
 scikit-image>=0.21
 torch>=2.0
+google-genai>=0.3
+python-dotenv>=1.0

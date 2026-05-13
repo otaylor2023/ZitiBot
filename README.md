@@ -99,3 +99,37 @@ Keys:
 - **SPACE** -- run the selected model on the current frame; pop a window with a jet-colormapped quality heatmap and the top antipodal grasp (red = gripper plates, green = opening width).
 - **s** -- save the latched grasp overlay as `grasp_<model>_<timestamp>.png` in the cwd.
 - **q** / **Esc** -- quit.
+
+### Gemini ER pointing demo
+
+`vision/gemini_point_demo.py` sends an RGB frame to **Gemini Robotics-ER 1.5** with a pointing prompt (default: "Point to the bowl") and overlays the returned `[y, x]` points on the image. Useful for high-level object / affordance localization that's hard to get from a Cornell-pretrained grasp net.
+
+Install (covers `google-genai` and the optional `python-dotenv` auto-loader):
+
+```bash
+pip install -r requirements.txt
+```
+
+Get an API key from [Google AI Studio](https://aistudio.google.com/) and put it in a `.env` file at the repo root — the script auto-loads it on every run (`.env` is gitignored):
+
+```bash
+echo 'GEMINI_API_KEY=your-key-here' > .env
+```
+
+A real `GEMINI_API_KEY` / `GOOGLE_API_KEY` environment variable also works if you prefer.
+
+Run on the live camera (SPACE captures the current frame and queries Gemini):
+
+```bash
+python vision/gemini_point_demo.py                       # default: point at "bowl"
+python vision/gemini_point_demo.py --object "pasta pot"
+python vision/gemini_point_demo.py --prompt "Point to the rim of the bowl."
+```
+
+Or query a single saved image (no camera required, handy on macOS without `librealsense`):
+
+```bash
+python vision/gemini_point_demo.py --image path/to/scene.jpg
+```
+
+Keys (live mode): **SPACE** = query Gemini, **s** = save the latched overlay, **q** / **Esc** = quit.

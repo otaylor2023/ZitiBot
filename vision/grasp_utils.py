@@ -55,13 +55,28 @@ def inpaint_depth(depth_m: np.ndarray) -> np.ndarray:
     return out
 
 
-def center_square_crop(img: np.ndarray, size: int | None = None) -> tuple[np.ndarray, CropInfo]:
-    """Center-crop ``img`` to a square of side ``size`` (defaults to the short side)."""
+def center_square_crop(
+    img: np.ndarray,
+    size: int | None = None,
+    bottom_exclude_px: int = 0,
+    top_exclude_px: int = 0,
+) -> tuple[np.ndarray, CropInfo]:
+    """Center-crop ``img`` to a square of side ``size`` (defaults to the short side).
+
+    ``bottom_exclude_px`` and ``top_exclude_px`` shrink the usable vertical band
+    so the crop never includes those rows. This is the right hook for masking out
+    e.g. a wrist-mounted gripper that sits in the bottom of the frame.
+    """
     h, w = img.shape[:2]
-    short = min(h, w)
+    bottom_exclude_px = max(0, int(bottom_exclude_px))
+    top_exclude_px = max(0, int(top_exclude_px))
+    usable_top = top_exclude_px
+    usable_bot = h - bottom_exclude_px
+    usable_h = max(1, usable_bot - usable_top)
+    short = min(usable_h, w)
     side = short if size is None else min(size, short)
     x0 = (w - side) // 2
-    y0 = (h - side) // 2
+    y0 = usable_top + (usable_h - side) // 2
     return img[y0:y0 + side, x0:x0 + side], CropInfo(x0=x0, y0=y0, size=side)
 
 
@@ -69,13 +84,17 @@ def preprocess_depth(
     depth_m: np.ndarray,
     crop_size: int | None = None,
     model_input: int = 300,
+    bottom_exclude_px: int = 0,
+    top_exclude_px: int = 0,
 ) -> tuple[np.ndarray, CropInfo]:
     """Depth (meters) -> normalized depth plane at ``model_input`` square, plus the crop info.
 
     Returns a float32 ndarray of shape ``(model_input, model_input)``.
     """
     filled = inpaint_depth(depth_m.astype(np.float32))
-    cropped, info = center_square_crop(filled, crop_size)
+    cropped, info = center_square_crop(
+        filled, crop_size, bottom_exclude_px=bottom_exclude_px, top_exclude_px=top_exclude_px
+    )
     resized = cv2.resize(cropped, (model_input, model_input), interpolation=cv2.INTER_AREA)
     # Per-image normalize: subtract mean, clip to [-1, 1]. Used by both upstreams.
     normed = np.clip(resized - resized.mean(), -1.0, 1.0).astype(np.float32)
