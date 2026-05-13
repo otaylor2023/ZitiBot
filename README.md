@@ -45,3 +45,47 @@ Binaries: **`bin/zitibot_mmp_example/simviz_zitibot_mmp_panda`** and **`controll
 - **Q** with keyboard focus in the **graphics window** closes the visualizer; the script stops the controller and exits.
 
 `./launch_zitibot.sh --help` lists options.
+
+## Vision
+
+Python utilities for the onboard Intel RealSense camera live under **`vision/`**.
+
+Install Python deps (works in a venv or conda env):
+
+```bash
+pip install -r requirements.txt
+```
+
+Note: `pyrealsense2` ships prebuilt wheels for Linux x86_64 and Windows. On macOS / Linux ARM you'll need to build `librealsense` from source.
+
+### Stream the camera
+
+```bash
+python vision/test_camera.py                # color + depth side by side
+python vision/test_camera.py --no-depth     # color only
+python vision/test_camera.py --fps 15       # drop fps if USB bandwidth is tight
+```
+
+`q` or `Esc` to quit.
+
+### GG-CNN2 grasp demo
+
+One-time: fetch the pretrained Cornell weights (~1 MB) from the upstream release.
+
+```bash
+bash vision/ggcnn/weights/download_weights.sh
+```
+
+Run the live stream + grasp prediction:
+
+```bash
+python vision/grasp_demo.py
+```
+
+Keys:
+
+- **SPACE** -- run GG-CNN2 on the current frame; pop a window with a jet-colormapped quality heatmap and the top antipodal grasp (red = gripper plates, green = opening width).
+- **s** -- save the latched grasp overlay as `grasp_<timestamp>.png` in the cwd.
+- **q** / **Esc** -- quit.
+
+The model is GG-CNN2 (Morrison et al., RSS 2018), vendored from [dougsm/ggcnn](https://github.com/dougsm/ggcnn) and trained on the Cornell Grasping Dataset. It assumes a parallel-jaw / 2-finger gripper.

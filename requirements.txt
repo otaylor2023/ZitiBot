@@ -1,3 +1,6 @@
 numpy>=1.24
 opencv-python>=4.8
 pyrealsense2>=2.54
+scipy>=1.11
+scikit-image>=0.21
+torch>=2.0
