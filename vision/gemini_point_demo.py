@@ -44,7 +44,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-DEFAULT_MODEL = "gemini-robotics-er-1.5-preview"
+DEFAULT_MODEL = "gemini-robotics-er-1.6-preview"
 
 
 # ---------------------------------------------------------------------------
