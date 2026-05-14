@@ -29,7 +29,7 @@
 bool fSimulationRunning = true;
 void sighandler(int){fSimulationRunning = false;}
 
-#include "redis_keys.h"
+#include "redis_keys_sim.h"
 
 using namespace Eigen;
 using namespace std;

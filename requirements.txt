@@ -6,3 +6,4 @@ scikit-image>=0.21
 torch>=2.0
 google-genai>=0.3
 python-dotenv>=1.0
+redis>=5.0

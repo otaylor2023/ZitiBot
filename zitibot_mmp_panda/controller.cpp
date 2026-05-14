@@ -13,7 +13,9 @@
 #include "timer/LoopTimer.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 using namespace std;
@@ -24,7 +26,7 @@ using namespace SaiPrimitives;
 bool runloop = false;
 void sighandler(int) { runloop = false; }
 
-#include "redis_keys.h"
+#include "redis_keys_sim.h"
 
 // World goal for link7: +Z along −world Z (approach down), then yaw about +world Z (degrees).
 // Finger joints use rpy (0,0,−π/4) on link7 (see mmp_panda.urdf); post-multiply +π/4 about
@@ -46,6 +48,21 @@ static Matrix3d link7_orientation_world(double roll_deg, double pitch_deg,
 	return R_down_and_rpy * R_finger_align;
 }
 
+static int redis_fatal(const string& msg) {
+	cerr << msg << endl;
+	return EXIT_FAILURE;
+}
+
+/** @return false if @p v.rows() * v.cols() != n */
+static bool require_eigen_length(const VectorXd& v, int n, const string& key) {
+	if (v.size() != n) {
+		cerr << "Controller: Redis key \"" << key << "\" must have length " << n
+			 << ", got " << v.size() << "." << endl;
+		return false;
+	}
+	return true;
+}
+
 enum State {
 	MOVE_BASE = 0,
 	EE_ABOVE_BOWL = 1,
@@ -55,7 +72,7 @@ enum State {
 	EE_POUR_BOWL = 5,
 };
 
-int main() {
+int main(int, char**) {
 	static const string robot_file =
 		string(CS225A_URDF_FOLDER) + "/mmp_panda/mmp_panda.urdf";
 
@@ -69,18 +86,34 @@ int main() {
 	Matrix3d ee_hover_R = Matrix3d::Identity();
 
 	auto redis_client = SaiCommon::RedisClient();
-	redis_client.connect();
+	try {
+		redis_client.connect();
+	} catch (const std::exception& e) {
+		return redis_fatal(string("Controller: Redis connect failed: ") + e.what());
+	}
 
 	signal(SIGABRT, &sighandler);
 	signal(SIGTERM, &sighandler);
 	signal(SIGINT, &sighandler);
 
 	auto robot = std::make_shared<SaiModel::SaiModel>(robot_file, false);
-	robot->setQ(redis_client.getEigen(JOINT_ANGLES_KEY));
-	robot->setDq(redis_client.getEigen(JOINT_VELOCITIES_KEY));
+	const int dof = robot->dof();
+	VectorXd q0;
+	VectorXd dq0;
+	try {
+		q0 = redis_client.getEigen(JOINT_ANGLES_KEY);
+		dq0 = redis_client.getEigen(JOINT_VELOCITIES_KEY);
+	} catch (const std::exception& e) {
+		return redis_fatal(string("Controller: initial Redis read failed: ") +
+						   e.what());
+	}
+	if (!require_eigen_length(q0, dof, JOINT_ANGLES_KEY) ||
+		!require_eigen_length(dq0, dof, JOINT_VELOCITIES_KEY)) {
+		return EXIT_FAILURE;
+	}
+	robot->setQ(q0);
+	robot->setDq(dq0);
 	robot->updateModel();
-
-	int dof = robot->dof();
 	VectorXd q_hold_for_pour = VectorXd::Zero(dof);
 	VectorXd command_torques = VectorXd::Zero(dof);
 	MatrixXd N_prec = MatrixXd::Identity(dof, dof);
@@ -127,14 +160,18 @@ int main() {
 	const Vector3d base_target(0.15, 0.18, 0.0);
 	const Vector3d base_pour_target(1.35, 0.18, 0.0);
 
-	// Hover / grasp offsets relative to settled bowl origin from sim (see BOWL_POSITION_KEY).
-	Vector3d bowl_pose(0.15, 0.70, 0.88);
 	VectorXd bowl_read = redis_client.getEigen(BOWL_POSITION_KEY);
+	Vector3d bowl_pose = Vector3d::Zero();
 	if (bowl_read.size() == 3) {
 		bowl_pose << bowl_read(0), bowl_read(1), bowl_read(2);
 	}
-	const Vector3d hover_offset(0.0, -0.13, 0.3);
-	const Vector3d grasp_offset(0.0, 0.0, -0.07);
+
+	// Bowl FSM: bowl origin from BOWL_POSITION_KEY; grasp = bowl + offset below (placeholder
+	// in world frame — replace with R_bowl * p_local when orientation is available).
+	static const Vector3d kBowlOriginToPickPointPlaceholder(0.0, -0.14, 0.2);
+	const Vector3d grasp_position = bowl_pose + kBowlOriginToPickPointPlaceholder;
+	// Hover / grasp / lift offsets are relative to pick_reference_world.
+	const Vector3d hover_offset(0, 0, 0.15);
 	// After grasp, move straight up in world +Z from the grasp goal (meters).
 	const double lift_dz = 0.15;
 
@@ -156,6 +193,7 @@ int main() {
 	const double tilt_duration_sec = 6.0;
 
 	runloop = true;
+	int main_rc = 0;
 	double control_freq = 1000;
 	SaiCommon::LoopTimer timer(control_freq, 1e6);
 
@@ -163,19 +201,29 @@ int main() {
 		timer.waitForNextLoop();
 		const double sim_time = timer.elapsedSimTime();
 
-		robot->setQ(redis_client.getEigen(JOINT_ANGLES_KEY));
-		robot->setDq(redis_client.getEigen(JOINT_VELOCITIES_KEY));
+		VectorXd q_read;
+		VectorXd dq_read;
+		try {
+			q_read = redis_client.getEigen(JOINT_ANGLES_KEY);
+			dq_read = redis_client.getEigen(JOINT_VELOCITIES_KEY);
+		} catch (const std::exception& e) {
+			cerr << "Controller: Redis read failed: " << e.what() << endl;
+			main_rc = EXIT_FAILURE;
+			runloop = false;
+			break;
+		}
+		if (!require_eigen_length(q_read, dof, JOINT_ANGLES_KEY) ||
+			!require_eigen_length(dq_read, dof, JOINT_VELOCITIES_KEY)) {
+			main_rc = EXIT_FAILURE;
+			runloop = false;
+			break;
+		}
+		robot->setQ(q_read);
+		robot->setDq(dq_read);
 		robot->updateModel();
 
-		VectorXd bowl_read_loop = redis_client.getEigen(BOWL_POSITION_KEY);
-		if (bowl_read_loop.size() == 3) {
-			bowl_pose << bowl_read_loop(0), bowl_read_loop(1), bowl_read_loop(2);
-		}
-
-		const Vector3d ee_hover_world = bowl_pose + hover_offset;
-		const Vector3d ee_grasp_world = ee_hover_world + grasp_offset;
-		const Vector3d ee_lift_world =
-			ee_grasp_world + Vector3d(0.0, 0.0, lift_dz);
+		const Vector3d ee_hover_world = grasp_position + hover_offset;
+		Vector3d ee_lift_world = grasp_position + Vector3d(0.0, 0.0, lift_dz);
 
 		if (state == MOVE_BASE) {
 			N_prec.setIdentity();
@@ -235,7 +283,7 @@ int main() {
 				cout << "EE_ABOVE_BOWL -> EE_GRASP_BOWL (gripper open, then descend)\n";
 				gripper_task->reInitializeTask();
 				gripper_task->setGoalPosition(gripper_opening);
-				pose_task->setGoalPosition(ee_grasp_world);
+				pose_task->setGoalPosition(grasp_position);
 				pose_task->setGoalOrientation(ee_hover_R);
 				grasp_phase = 0;
 				state = EE_GRASP_BOWL;
@@ -246,11 +294,11 @@ int main() {
 			// 2: command close until fingers converged
 			// 3: hold closed at grasp, grasp_closed_dwell_sec, then lift
 			if (grasp_phase == 0 || grasp_phase == 1) {
-				pose_task->setGoalPosition(ee_grasp_world);
+				pose_task->setGoalPosition(grasp_position);
 				pose_task->setGoalOrientation(ee_hover_R);
 				gripper_task->setGoalPosition(gripper_opening);
 			} else {
-				pose_task->setGoalPosition(ee_grasp_world);
+				pose_task->setGoalPosition(grasp_position);
 				pose_task->setGoalOrientation(ee_hover_R);
 				gripper_task->setGoalPosition(gripper_closed);
 			}
@@ -270,7 +318,7 @@ int main() {
 
 			if (grasp_phase == 0) {
 				Vector3d x = robot->position(control_link, control_point);
-				if ((x - ee_grasp_world).norm() < ee_pos_convergence_tol) {
+				if ((x - grasp_position).norm() < ee_pos_convergence_tol) {
 					cout << "EE_GRASP_BOWL: at grasp pose; dwell open "
 						 << grasp_open_dwell_sec << " s\n";
 					grasp_phase = 1;
@@ -414,7 +462,6 @@ int main() {
 				tilt_complete_printed = true;
 			}
 		}
-
 		// Publish pose-task EE goal for simviz / debugging (control point in world).
 		Vector3d ee_goal_pos_world(0.0, 0.0, 0.0);
 		Matrix3d ee_goal_R_world = Matrix3d::Identity();
@@ -425,7 +472,7 @@ int main() {
 			ee_goal_R_world = ee_hover_R;
 		} else if (state == EE_GRASP_BOWL) {
 			ee_goal_active = 1.0;
-			ee_goal_pos_world = ee_grasp_world;
+			ee_goal_pos_world = grasp_position;
 			ee_goal_R_world = ee_hover_R;
 		} else if (state == EE_LIFT_BOWL) {
 			ee_goal_active = 1.0;
@@ -463,5 +510,5 @@ int main() {
 	timer.printInfoPostRun();
 	redis_client.setEigen(JOINT_TORQUES_COMMANDED_KEY, 0 * command_torques);
 
-	return 0;
+	return main_rc;
 }
