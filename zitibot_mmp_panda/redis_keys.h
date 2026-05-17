@@ -15,7 +15,7 @@ const std::string JOINT_VELOCITIES_KEY = "sai::sensors::FrankaRobot::joint_veloc
 const std::string JOINT_TORQUES_KEY = "sai::sensors::FrankaRobot::joint_torques";
 const std::string CONTROL_TORQUES_KEY = "sai::commands::FrankaRobot::control_torques";
 
-// tidybot base pose (optional for future controllers).
+// OptiTrack / mocap rigid-body pose on Redis (see opti_controller.py).
 const std::string TIDYBOT_POSITION_KEY = "tidybot01::pos";
 const std::string TIDYBOT_ORIENTATION_KEY = "tidybot01::ori";
 

@@ -4,7 +4,7 @@
 # Source: https://github.com/skumra/robotic-grasping/tree/master/trained-models
 #
 # After running, this directory will contain:
-#   grconvnet3_cornell_rgbd.pt   (loaded by vision/grasp_demo.py --model grconvnet)
+#   grconvnet3_cornell_rgbd.pt   (loaded by python_control/vision/grasp_demo.py --model grconvnet)
 #
 # Re-run is idempotent: skips the download if the target file already exists.
 
@@ -52,6 +52,6 @@ Browse the upstream tree:
   https://github.com/skumra/robotic-grasping/tree/master/trained-models
 
 Pick any file from a `cornell-randsplit-rgbd-grconvnet3-*` directory, then:
-  curl -L -o vision/grconvnet/weights/grconvnet3_cornell_rgbd.pt <raw_github_url>
+  curl -L -o python_control/vision/grconvnet/weights/grconvnet3_cornell_rgbd.pt <raw_github_url>
 EOF
 exit 1

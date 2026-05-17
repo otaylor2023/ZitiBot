@@ -5,7 +5,7 @@
 #   https://github.com/dougsm/ggcnn/releases/tag/v0.1
 #
 # After running, this directory will contain:
-#   ggcnn2_cornell_statedict.pt   (the file vision/grasp_demo.py loads)
+#   ggcnn2_cornell_statedict.pt   (the file python_control/vision/grasp_demo.py loads)
 #
 # Re-run is idempotent: skips the download if the target file already exists.
 

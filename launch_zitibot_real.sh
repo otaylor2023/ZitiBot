@@ -18,26 +18,20 @@ set -euo pipefail
 WAIT_FOR_SPACE=false
 RUN_BUILD=false
 TOUCH_DEMO=true
-GEMINI_TOUCH=false
 for arg in "$@"; do
 	case "${arg}" in
 		--wait) WAIT_FOR_SPACE=true ;;
 		--build) RUN_BUILD=true ;;
 		--main) TOUCH_DEMO=false ;;
 		--touch) TOUCH_DEMO=true ;;
-		--gemini)
-			GEMINI_TOUCH=true
-			TOUCH_DEMO=true
-			;;
 		-h | --help)
-			echo "Usage: $(basename "$0") [--wait] [--build] [--main] [--touch] [--gemini]"
+			echo "Usage: $(basename "$0") [--wait] [--build] [--main] [--touch]"
 			echo "  Real robot: starts only a controller (no simviz)."
 			echo "  Default: controller_touch_zitibot_mmp_panda (touch / offset demo)."
 			echo "  --main    run controller_zitibot_mmp_panda (full pick FSM; needs bowl pose in Redis)"
 			echo "  --touch   force touch controller (same as default)"
 			echo "  --wait    require SPACE in this terminal before starting the controller"
 			echo "  --build   CMake configure + build controller binaries only (no simviz)"
-			echo "  --gemini  touch controller with --gemini (follow gemini_target_ee_* on Redis)"
 			echo ""
 			echo "Prerequisites:"
 			echo "  - Redis running."
@@ -138,15 +132,8 @@ else
 fi
 
 echo "Starting: ${CTRL_EXE}"
-if [[ "${GEMINI_TOUCH}" == true ]]; then
-	echo "(touch controller with --gemini: uses vision Redis goal when active)"
-fi
 echo "Ctrl+C here stops the controller. 'q' + Enter also stops (while this script waits)."
-if [[ "${GEMINI_TOUCH}" == true ]]; then
-	"${CTRL_EXE}" --gemini &
-else
-	"${CTRL_EXE}" &
-fi
+"${CTRL_EXE}" &
 CTRL_PID=$!
 
 while kill -0 "${CTRL_PID}" 2>/dev/null; do

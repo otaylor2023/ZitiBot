@@ -19,12 +19,12 @@ Keys:
 
 Usage:
   # First time only: download whichever model's weights you want.
-  bash vision/ggcnn/weights/download_weights.sh        # GG-CNN2
-  bash vision/grconvnet/weights/download_weights.sh    # GR-ConvNet
+  bash python_control/vision/ggcnn/weights/download_weights.sh        # GG-CNN2
+  bash python_control/vision/grconvnet/weights/download_weights.sh    # GR-ConvNet
 
-  python vision/grasp_demo.py                    # defaults to ggcnn2
-  python vision/grasp_demo.py --model grconvnet
-  python vision/grasp_demo.py --model grconvnet --crop 400
+  python python_control/vision/grasp_demo.py                    # defaults to ggcnn2
+  python python_control/vision/grasp_demo.py --model grconvnet
+  python python_control/vision/grasp_demo.py --model grconvnet --crop 400
 """
 
 from __future__ import annotations
@@ -41,7 +41,8 @@ import pyrealsense2 as rs
 import torch
 
 # Make the sibling packages ('ggcnn', 'grconvnet', shared utils) importable when
-# running this file directly from the repo root, e.g. `python vision/grasp_demo.py`.
+# running this file directly from the ZitiBot root, e.g.
+# ``python python_control/vision/grasp_demo.py``.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from grasp_utils import (  # noqa: E402

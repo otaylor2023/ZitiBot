@@ -48,7 +48,7 @@ Binaries: **`bin/zitibot_mmp_example/simviz_zitibot_mmp_panda`** and **`controll
 
 ## Vision
 
-Python utilities for the onboard Intel RealSense camera live under **`vision/`**.
+Python utilities for the onboard Intel RealSense camera live under **`python_control/vision/`** (library code used by scripts in **`python_control/`**).
 
 Install Python deps (works in a venv or conda env):
 
@@ -61,16 +61,16 @@ Note: `pyrealsense2` ships prebuilt wheels for Linux x86_64 and Windows. On macO
 ### Stream the camera
 
 ```bash
-python vision/test_camera.py                # color + depth side by side
-python vision/test_camera.py --no-depth     # color only
-python vision/test_camera.py --fps 15       # drop fps if USB bandwidth is tight
+python python_control/vision/test_camera.py                # color + depth side by side
+python python_control/vision/test_camera.py --no-depth     # color only
+python python_control/vision/test_camera.py --fps 15       # drop fps if USB bandwidth is tight
 ```
 
 `q` or `Esc` to quit.
 
 ### Grasp demo (parallel-jaw / 2-finger gripper)
 
-`vision/grasp_demo.py` streams the RealSense and, on SPACE, runs a heatmap grasp predictor on the current RGB-D frame. Two pretrained models are bundled, selected with `--model`:
+`python_control/vision/grasp_demo.py` streams the RealSense and, on SPACE, runs a heatmap grasp predictor on the current RGB-D frame. Two pretrained models are bundled, selected with `--model`:
 
 | `--model` | Network | Input | Default size | Source |
 |-----------|---------|-------|--------------|--------|
@@ -82,16 +82,16 @@ Both are single-pass heatmap networks and run real-time on CPU. GR-ConvNet is he
 One-time: fetch whichever model's pretrained Cornell weights you want.
 
 ```bash
-bash vision/ggcnn/weights/download_weights.sh        # ~1 MB
-bash vision/grconvnet/weights/download_weights.sh    # ~30 MB
+bash python_control/vision/ggcnn/weights/download_weights.sh        # ~1 MB
+bash python_control/vision/grconvnet/weights/download_weights.sh    # ~30 MB
 ```
 
 Run:
 
 ```bash
-python vision/grasp_demo.py                          # ggcnn2 (default)
-python vision/grasp_demo.py --model grconvnet
-python vision/grasp_demo.py --model grconvnet --crop 400 --fps 15
+python python_control/vision/grasp_demo.py                          # ggcnn2 (default)
+python python_control/vision/grasp_demo.py --model grconvnet
+python python_control/vision/grasp_demo.py --model grconvnet --crop 400 --fps 15
 ```
 
 Keys:
@@ -100,9 +100,17 @@ Keys:
 - **s** -- save the latched grasp overlay as `grasp_<model>_<timestamp>.png` in the cwd.
 - **q** / **Esc** -- quit.
 
-### Gemini ER pointing demo
+### Gemini ER pointing + robot (OpenSai Redis)
 
-`vision/gemini_point_demo.py` sends an RGB frame to **Gemini Robotics-ER 1.5** with a pointing prompt (default: "Point to the bowl") and overlays the returned `[y, x]` points on the image. Useful for high-level object / affordance localization that's hard to get from a Cornell-pretrained grasp net.
+**`python_control/vision_controller.py`** runs the live RealSense + **Gemini Robotics-ER** overlay, then on **ENTER** writes OpenSai Franka **cartesian_task** goal position/orientation to Redis (same JSON keys as `python_control/touch_controller.py`). **SPACE** queries Gemini; **s** saves the overlay; **q** / **Esc** quits.
+
+For a **single saved image** (2D keypoints only, no camera, no Redis), use:
+
+```bash
+python python_control/gemini_image_cli.py --image path/to/scene.jpg
+```
+
+Gemini/geometry helpers live under **`python_control/vision/gemini_pointing.py`** (library only — no Redis).
 
 Install (covers `google-genai` and the optional `python-dotenv` auto-loader):
 
@@ -110,7 +118,7 @@ Install (covers `google-genai` and the optional `python-dotenv` auto-loader):
 pip install -r requirements.txt
 ```
 
-Get an API key from [Google AI Studio](https://aistudio.google.com/) and put it in a `.env` file at the repo root — the script auto-loads it on every run (`.env` is gitignored):
+Get an API key from [Google AI Studio](https://aistudio.google.com/) and put it in a `.env` file at the repo root — the library auto-loads it on every run (`.env` is gitignored):
 
 ```bash
 echo 'GEMINI_API_KEY=your-key-here' > .env
@@ -118,18 +126,12 @@ echo 'GEMINI_API_KEY=your-key-here' > .env
 
 A real `GEMINI_API_KEY` / `GOOGLE_API_KEY` environment variable also works if you prefer.
 
-Run on the live camera (SPACE captures the current frame and queries Gemini):
+Live camera + robot goals (from the OpenSai / ZitiBot repo root):
 
 ```bash
-python vision/gemini_point_demo.py                       # default: point at "bowl"
-python vision/gemini_point_demo.py --object "pasta pot"
-python vision/gemini_point_demo.py --prompt "Point to the rim of the bowl."
+python python_control/vision_controller.py
+python python_control/vision_controller.py --object "pasta pot"
+python python_control/vision_controller.py --prompt "Point to the rim of the bowl."
 ```
 
-Or query a single saved image (no camera required, handy on macOS without `librealsense`):
-
-```bash
-python vision/gemini_point_demo.py --image path/to/scene.jpg
-```
-
-Keys (live mode): **SPACE** = query Gemini, **s** = save the latched overlay, **q** / **Esc** = quit.
+Keys (live): **SPACE** = query Gemini, **ENTER** = send cartesian goal, **s** = save overlay, **q** / **Esc** = quit.

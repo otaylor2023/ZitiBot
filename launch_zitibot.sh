@@ -6,23 +6,17 @@ set -euo pipefail
 WAIT_FOR_SPACE=false
 RUN_BUILD=false
 TOUCH_DEMO=false
-GEMINI_TOUCH=false
 for arg in "$@"; do
 	case "${arg}" in
 		--wait) WAIT_FOR_SPACE=true ;;
 		--build) RUN_BUILD=true ;;
 		--touch) TOUCH_DEMO=true ;;
-		--gemini)
-			GEMINI_TOUCH=true
-			TOUCH_DEMO=true
-			;;
 		-h | --help)
-			echo "Usage: $(basename "$0") [--wait] [--build] [--touch] [--gemini]"
+			echo "Usage: $(basename "$0") [--wait] [--build] [--touch]"
 			echo "  default   visualizer, countdown, controller (no build)"
 			echo "  --wait    wait for SPACE in this terminal before starting the controller"
 			echo "  --build   run CMake configure + build for ZitiBot targets, then launch"
 			echo "  --touch   run controller_touch (hardware Redis keys only; not simviz keys)"
-			echo "  --gemini  same as --touch, plus --gemini (follow gemini_target_ee_* on Redis)"
 			echo "Env: JOBS, CMAKE_BUILD_TYPE (same as build_zitibot.sh)"
 			echo "Redis must already be running."
 			exit 0
@@ -133,14 +127,10 @@ else
 fi
 
 echo "Starting controller (Ctrl+C or 'q' here stops both; Q in sim window also exits)..."
-if [[ "${TOUCH_DEMO}" == true ]]; then
-	echo "(controller_touch_zitibot_mmp_panda — hardware Redis keys only; not simviz keys)"
-	echo "Simviz alone publishes sim keys; use a robot/bridge Redis or do not use --touch here."
-	if [[ "${GEMINI_TOUCH}" == true ]]; then
-		"${CTRL_TOUCH}" --gemini &
-	else
+	if [[ "${TOUCH_DEMO}" == true ]]; then
+		echo "(controller_touch_zitibot_mmp_panda — hardware Redis keys only; not simviz keys)"
+		echo "Simviz alone publishes sim keys; use a robot/bridge Redis or do not use --touch here."
 		"${CTRL_TOUCH}" &
-	fi
 else
 	"${CTRL}" &
 fi

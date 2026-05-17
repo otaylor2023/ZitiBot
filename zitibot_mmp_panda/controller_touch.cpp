@@ -1,17 +1,13 @@
 /**
  * @file controller_touch.cpp
- * @brief Standalone touch demo: move link7 control point to startup EE + world offset.
+ * @brief Standalone touch demo: move link7 control point to a fixed world goal.
  *
- * Default: fixed world goal = initial control-point position + kTouchOffsetWorld.
- * With ``--gemini``: while ``gemini_target_ee_active`` > 0.5, goal position is
- * ``R_world_link7 * p_ee + origin_link7_world`` from Redis (p_ee from vision);
- * otherwise the same hardcoded offset goal as default mode.
+ * Latches **one** world goal = first synced EE (from Redis, after expand) +
+ * ``kTouchOffsetWorld`` (world axes). Stored in ``std::optional`` and never
+ * recomputed from the moving tip.
  *
- * Redis: always ``redis_keys.h`` (hardware) — Franka joint_positions /
- * joint_velocities may be length 7 (Franka arm) or full ``dof``; we expand into
- * the mmp_panda model (3 base + 7 arm + 2 fingers). Command torques published to
- * Redis are the **7 arm** components (Franka ``control_torques``). Not compatible
- * with simviz’s sim key namespace. Do not run two controllers on one Redis.
+ * Redis: ``redis_keys.h`` — Franka joint_positions / joint_velocities in;
+ * EE goal keys out. Torques optional (dry run: pose task only, no publish).
  */
 
 #include <SaiModel.h>
@@ -19,10 +15,13 @@
 #include "redis/RedisClient.h"
 #include "timer/LoopTimer.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -81,25 +80,13 @@ static int redis_fatal(const string& msg) {
 	return EXIT_FAILURE;
 }
 
-static bool parse_use_gemini(int argc, char** argv) {
-	for (int i = 1; i < argc; ++i) {
-		if (strcmp(argv[i], "--gemini") == 0) {
-			return true;
-		}
-		cerr << "controller_touch: unknown argument: " << argv[i] << "\n";
-		cerr << "Usage: controller_touch_zitibot_mmp_panda [--gemini]\n";
-		exit(EXIT_FAILURE);
-	}
-	return false;
-}
-
 int main(int argc, char** argv) {
+	(void)argc;
+	(void)argv;
+
 	static const string robot_file =
 		string(CS225A_URDF_FOLDER) + "/mmp_panda/mmp_panda.urdf";
 
-	const bool use_gemini_mode = parse_use_gemini(argc, argv);
-
-	// World-frame offset (m) from the startup EE control point to the touch goal.
 	static const Vector3d kTouchOffsetWorld(0.2, 0.0, 0.0);
 	const double ee_pos_convergence_tol = 2.5e-2;
 
@@ -117,7 +104,19 @@ int main(int argc, char** argv) {
 	auto robot = std::make_shared<SaiModel::SaiModel>(robot_file, false);
 	const int dof = robot->dof();
 
-	// When Redis has 7 Franka joints only, we fill base + fingers from this template.
+	cout << "\ncontroller_touch: Redis keys (from redis_keys.h)\n"
+		 << "  READ  " << JOINT_POSITIONS_KEY << "\n"
+		 << "  READ  " << JOINT_VELOCITIES_KEY << "\n"
+		 << "  WRITE " << EE_GOAL_POSITION_KEY << "\n"
+		 << "  WRITE " << EE_GOAL_ROTATION_KEY << "\n"
+		 << "  WRITE " << EE_GOAL_ACTIVE_KEY << "\n"
+		 << "  WRITE " << CONTROL_TORQUES_KEY << " (vector length "
+		 << (dof >= kFrankaArmStartIdx + kFrankaArmDof ? kFrankaArmDof : dof) << ")\n"
+		 << "  NOTE: CONTROL_TORQUES_KEY publish is commented out (dry run).\n"
+		 << "  NOTE: Only pose task torques computed (no base / gripper / posture).\n"
+		 << "  model dof=" << dof << "\n"
+		 << flush;
+
 	VectorXd q_expand_template = VectorXd::Zero(dof);
 	VectorXd dq_expand_template = VectorXd::Zero(dof);
 	if (dof >= 2) {
@@ -142,7 +141,10 @@ int main(int argc, char** argv) {
 	robot->updateModel();
 
 	const string control_link = "link7";
-	const Vector3d control_point(0, 0, 0.07);
+	const Vector3d control_point(0, 0, 0.1);
+	cout << "  EE task: link=\"" << control_link << "\"  control_point in link (m) "
+		 << control_point.transpose() << "\n\n"
+		 << flush;
 	Affine3d compliant_frame = Affine3d::Identity();
 	compliant_frame.translation() = control_point;
 	auto pose_task =
@@ -150,59 +152,54 @@ int main(int argc, char** argv) {
 														 compliant_frame);
 	pose_task->setPosControlGains(400, 40, 0);
 	pose_task->setOriControlGains(0.0, 0.0, 0.0);
+	pose_task->enableVelocitySaturation(0.3, M_PI/3.0);
 
+	// Base / posture / gripper tasks (disabled — pose-only dry run).
 	MatrixXd base_selection_matrix = MatrixXd::Zero(3, robot->dof());
 	base_selection_matrix(0, 0) = 1;
 	base_selection_matrix(1, 1) = 1;
 	base_selection_matrix(2, 2) = 1;
 	auto base_task =
-		std::make_shared<SaiPrimitives::JointTask>(robot, base_selection_matrix);
+			std::make_shared<SaiPrimitives::JointTask>(robot, base_selection_matrix);
 	base_task->setGains(400, 40, 0);
+	//
+	// auto joint_task = std::make_shared<SaiPrimitives::JointTask>(robot);
+	// const double joint_kp_nullspace_ee = 250.0;
+	// const double joint_kv_nullspace_ee = 60.0;
+	// joint_task->setGains(100.0, 20.0, 0);
+	//
+	// MatrixXd gripper_selection_matrix = MatrixXd::Zero(2, dof);
+	// gripper_selection_matrix(0, dof - 2) = 1;
+	// gripper_selection_matrix(1, dof - 1) = 1;
+	// auto gripper_task = std::make_shared<SaiPrimitives::JointTask>(
+	// 		robot, gripper_selection_matrix);
+	// gripper_task->setDynamicDecouplingType(
+	// 		SaiPrimitives::DynamicDecouplingType::IMPEDANCE);
+	// gripper_task->setGains(5e3, 1e2, 0);
+	//
+	// const Vector2d gripper_opening(0.04, -0.04);
 
-	auto joint_task = std::make_shared<SaiPrimitives::JointTask>(robot);
-	const double joint_kp_nullspace_ee = 250.0;
-	const double joint_kv_nullspace_ee = 60.0;
-	joint_task->setGains(100.0, 20.0, 0);
+	std::optional<Vector3d> latched_pose_goal_world;
 
-	MatrixXd gripper_selection_matrix = MatrixXd::Zero(2, dof);
-	gripper_selection_matrix(0, dof - 2) = 1;
-	gripper_selection_matrix(1, dof - 1) = 1;
-	auto gripper_task = std::make_shared<SaiPrimitives::JointTask>(
-		robot, gripper_selection_matrix);
-	gripper_task->setDynamicDecouplingType(
-		SaiPrimitives::DynamicDecouplingType::IMPEDANCE);
-	gripper_task->setGains(5e3, 1e2, 0);
-
-	const Vector2d gripper_opening(0.04, -0.04);
-
-	const Vector3d p0 = robot->position(control_link, control_point);
-	const Vector3d touch_goal_hardcoded = p0 + kTouchOffsetWorld;
-	Vector3d touch_goal_world = touch_goal_hardcoded;
-	if (use_gemini_mode) {
-		cout << "controller_touch: --gemini  goal from Redis when "
-				"gemini_target_ee_active>0.5; else hardcoded offset "
-			 << kTouchOffsetWorld.transpose() << " m (world)\n";
-	} else {
-		cout << "controller_touch: goal = EE at start + offset "
-			 << kTouchOffsetWorld.transpose() << " m (world)\n";
-	}
+	cout << "controller_touch: goal = first synced EE (Redis) + offset "
+		 << kTouchOffsetWorld.transpose() << " m (world)\n";
 
 	Matrix3d ee_touch_R = link7_orientation_world(0.0, 0.0, 0.0);
 	bool touch_arrived_printed = false;
 
 	pose_task->reInitializeTask();
 	base_task->reInitializeTask();
-	joint_task->reInitializeTask();
-	gripper_task->reInitializeTask();
-	gripper_task->setGoalPosition(gripper_opening);
+	// joint_task->reInitializeTask();
+	// gripper_task->reInitializeTask();
+	// gripper_task->setGoalPosition(gripper_opening);
 	base_task->setGoalPosition(robot->q().head(3));
 	base_task->setGains(220, 55, 0);
-	pose_task->setGoalPosition(touch_goal_hardcoded);
+	pose_task->setGoalPosition(robot->position(control_link, control_point));
 	pose_task->setGoalOrientation(ee_touch_R);
 	pose_task->setPosControlGains(200, 95, 0);
 	pose_task->setOriControlGains(240.0, 55.0, 0.0);
-	joint_task->setGoalPosition(robot->q());
-	joint_task->setGains(joint_kp_nullspace_ee, joint_kv_nullspace_ee, 0);
+	// joint_task->setGoalPosition(robot->q());
+	// joint_task->setGains(joint_kp_nullspace_ee, joint_kv_nullspace_ee, 0);
 
 	VectorXd command_torques = VectorXd::Zero(dof);
 	MatrixXd N_prec = MatrixXd::Identity(dof, dof);
@@ -213,6 +210,8 @@ int main(int argc, char** argv) {
 
 	VectorXd q_prev_full = q0;
 	VectorXd dq_prev_full = dq0;
+	auto status_print_last =
+			std::chrono::steady_clock::now() - std::chrono::seconds(1);
 
 	while (runloop) {
 		timer.waitForNextLoop();
@@ -234,45 +233,41 @@ int main(int argc, char** argv) {
 		}
 		robot->updateModel();
 
-		if (use_gemini_mode) {
-			bool gemini_live = false;
-			Vector3d p_ee = Vector3d::Zero();
-			try {
-				VectorXd act = redis_client.getEigen(GEMINI_TARGET_EE_ACTIVE_KEY);
-				if (act.size() == 1 && act(0) > 0.5) {
-					VectorXd pe = redis_client.getEigen(GEMINI_TARGET_EE_POSITION_KEY);
-					if (pe.size() == 3) {
-						p_ee = pe;
-						gemini_live = true;
-					}
-				}
-			} catch (const std::exception&) {
-				// Keys missing or malformed — fall back to hardcoded goal
-			}
-			if (gemini_live) {
-				const Vector3d origin_w =
-					robot->position(control_link, Vector3d::Zero());
-				touch_goal_world = origin_w + robot->rotation(control_link) * p_ee;
-			} else {
-				touch_goal_world = touch_goal_hardcoded;
-			}
+		if (!latched_pose_goal_world.has_value()) {
+			const Vector3d cur_ee = robot->position(control_link, control_point);
+			latched_pose_goal_world.emplace(cur_ee + kTouchOffsetWorld);
+			cout << fixed << setprecision(4);
+			cout << "controller_touch: latched goal (world m)\n"
+				 << "  EE_current=" << cur_ee.transpose() << "\n"
+				 << "  goal      =" << latched_pose_goal_world->transpose() << "\n"
+				 << "  offset    =" << kTouchOffsetWorld.transpose() << "\n"
+				 << flush;
+			pose_task->reInitializeTask();
+			pose_task->setGoalPosition(latched_pose_goal_world.value());
+			pose_task->setGoalOrientation(ee_touch_R);
+			pose_task->setPosControlGains(200, 95, 0);
+			pose_task->setOriControlGains(240.0, 55.0, 0.0);
 		}
 
-		pose_task->setGoalPosition(touch_goal_world);
+		const Vector3d pose_goal_world = latched_pose_goal_world.value();
+
+		pose_task->setGoalPosition(pose_goal_world);
 		pose_task->setGoalOrientation(ee_touch_R);
-		gripper_task->setGoalPosition(gripper_opening);
+		// gripper_task->setGoalPosition(gripper_opening);
+		base_task->setGoalPosition(robot->q().head(3));
 
 		N_prec.setIdentity();
 		pose_task->updateTaskModel(N_prec);
 		base_task->updateTaskModel(pose_task->getTaskAndPreviousNullspace());
-		gripper_task->updateTaskModel(base_task->getTaskAndPreviousNullspace());
-		joint_task->updateTaskModel(gripper_task->getTaskAndPreviousNullspace());
+		// gripper_task->updateTaskModel(base_task->getTaskAndPreviousNullspace());
+		// joint_task->updateTaskModel(gripper_task->getTaskAndPreviousNullspace());
 
-		command_torques = pose_task->computeTorques() + base_task->computeTorques() +
-						  joint_task->computeTorques() + gripper_task->computeTorques();
+		const VectorXd tau_pose = pose_task->computeTorques();
+		const VectorXd tau_base = base_task->computeTorques();
+		command_torques = tau_pose + tau_base;
 
 		const Vector3d x_touch = robot->position(control_link, control_point);
-		const double touch_err = (x_touch - touch_goal_world).norm();
+		const double touch_err = (x_touch - pose_goal_world).norm();
 		if (touch_err < ee_pos_convergence_tol) {
 			if (!touch_arrived_printed) {
 				cout << "controller_touch: at goal (hold)\n";
@@ -282,8 +277,22 @@ int main(int argc, char** argv) {
 			touch_arrived_printed = false;
 		}
 
+		// Status line at 1 Hz (wall clock): q, EE, pose errors, pose torques (not sent).
+		const auto now = std::chrono::steady_clock::now();
+		if (now - status_print_last >= std::chrono::seconds(1)) {
+			status_print_last = now;
+			cout << fixed << setprecision(5) << "controller_touch: q=" << robot->q().transpose()
+				 << "\n  EE_world_m=" << x_touch.transpose()
+				 << "\n  pose_err_pos_m=" << pose_task->getPositionError().transpose()
+				 << "\n  pose_err_ori=" << pose_task->getOrientationError().transpose()
+				 << "\n  tau_pose=" << tau_pose.transpose()
+				 << "\n  tau_base=" << tau_base.transpose()
+				 << "\n  tau_total=" << command_torques.transpose()
+				 << flush;
+		}
+
 		Matrix3d ee_goal_R_world = ee_touch_R;
-		Vector3d ee_goal_pos_world = touch_goal_world;
+		Vector3d ee_goal_pos_world = pose_goal_world;
 		VectorXd ee_goal_R_flat(9);
 		ee_goal_R_flat << ee_goal_R_world.col(0), ee_goal_R_world.col(1),
 			ee_goal_R_world.col(2);
@@ -295,21 +304,22 @@ int main(int argc, char** argv) {
 		ee_goal_active_v(0) = 1.0;
 		redis_client.setEigen(EE_GOAL_ACTIVE_KEY, ee_goal_active_v);
 
-		if (dof >= kFrankaArmStartIdx + kFrankaArmDof) {
-			redis_client.setEigen(CONTROL_TORQUES_KEY,
-					command_torques.segment(kFrankaArmStartIdx, kFrankaArmDof));
-		} else {
-			redis_client.setEigen(CONTROL_TORQUES_KEY, command_torques);
-		}
+		// Robot torque command (commented out — uncomment to drive hardware).
+		// if (dof >= kFrankaArmStartIdx + kFrankaArmDof) {
+		// 	redis_client.setEigen(CONTROL_TORQUES_KEY,
+		// 			command_torques.segment(kFrankaArmStartIdx, kFrankaArmDof));
+		// } else {
+		// 	redis_client.setEigen(CONTROL_TORQUES_KEY, command_torques);
+		// }
 	}
 
 	timer.stop();
 	cout << "\ncontroller_touch timer stats:\n";
 	timer.printInfoPostRun();
-	if (dof >= kFrankaArmStartIdx + kFrankaArmDof) {
-		redis_client.setEigen(CONTROL_TORQUES_KEY, VectorXd::Zero(kFrankaArmDof));
-	} else {
-		redis_client.setEigen(CONTROL_TORQUES_KEY, 0 * command_torques);
-	}
+	// if (dof >= kFrankaArmStartIdx + kFrankaArmDof) {
+	// 	redis_client.setEigen(CONTROL_TORQUES_KEY, VectorXd::Zero(kFrankaArmDof));
+	// } else {
+	// 	redis_client.setEigen(CONTROL_TORQUES_KEY, 0 * command_torques);
+	// }
 	return 0;
 }

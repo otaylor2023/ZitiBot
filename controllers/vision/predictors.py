@@ -69,7 +69,7 @@ class GGCNN2Predictor:
         if not weights_path.is_file():
             raise FileNotFoundError(
                 f"GG-CNN2 weights not found at {weights_path}. "
-                "Run vision/ggcnn/weights/download_weights.sh first."
+                "Run python_control/vision/ggcnn/weights/download_weights.sh first."
             )
         state = torch.load(weights_path, map_location=device, weights_only=True)
         model = GGCNN2()
@@ -127,7 +127,7 @@ class GRConvNetPredictor:
         if not weights_path.is_file():
             raise FileNotFoundError(
                 f"GR-ConvNet weights not found at {weights_path}. "
-                "Run vision/grconvnet/weights/download_weights.sh first."
+                "Run python_control/vision/grconvnet/weights/download_weights.sh first."
             )
         # Upstream saves the full model object, so weights_only=False is required.
         model = torch.load(weights_path, map_location=device, weights_only=False)
