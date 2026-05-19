@@ -31,6 +31,18 @@ controller_to_use = "cartesian_controller"
 
 X_OFFSET_M = 0.02
 
+# Home pose: EE at ~[0.6, -0.2, 0.35] m, tool z down, 45° yaw.
+_HOME_YAW_RAD = np.radians(45.0)
+_c, _s = np.cos(_HOME_YAW_RAD), np.sin(_HOME_YAW_RAD)
+HOME_GOAL_POSITION = np.array([0.6, -0.2, 0.35])
+HOME_GOAL_ORIENTATION = np.array(
+    [
+        [_c, -_s, 0.0],
+        [-_s, -_c, 0.0],
+        [0.0, 0.0, -1.0],
+    ]
+)
+
 redis_client = redis.Redis()
 
 config_file_name = redis_client.get(redis_keys.config_file_name).decode("utf-8")
@@ -52,9 +64,12 @@ current_position = np.array(
 current_orientation = np.array(
     json.loads(redis_client.get(redis_keys.cartesian_task_current_orientation))
 )
-goal_pos = current_position + np.array([X_OFFSET_M, 0.0, 0.0])
-goal_ori = current_orientation.copy()
-print(f"start pos {current_position}, goal pos {goal_pos}")
+goal_pos = HOME_GOAL_POSITION.copy()
+goal_ori = HOME_GOAL_ORIENTATION.copy()
+print(
+    f"start pos {current_position} ori=\n{current_orientation}\n"
+    f"goal pos {goal_pos} ori=\n{goal_ori}"
+)
 
 loop_time = 0.0
 dt = 0.01
@@ -79,10 +94,10 @@ try:
             json.loads(redis_client.get(redis_keys.cartesian_task_current_orientation))
         )
 
-        pos_error = np.linalg.norm(goal_pos - current_position)
-        ori_error = np.linalg.norm(goal_ori - current_orientation)
-        if int(loop_time * 100) % 100 == 0:
-            print(f"pos_error={pos_error:.4f}  ori_error={ori_error:.4f}")
+        print(
+            f"pos={current_position}  ori={current_orientation}",
+            flush=True,
+        )
 
 except KeyboardInterrupt:
     print("Keyboard interrupt")

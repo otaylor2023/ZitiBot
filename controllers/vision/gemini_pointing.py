@@ -65,7 +65,7 @@ assert np.linalg.det(_R_VISION_FROM_RS_OPTICAL) > 0
 # Defaults: +0.04 m EE +X, Z from ``ZITIBOT_PLACEHOLDER_T_EE_CAM_Z_M`` (override X/Z or use
 # ``--ee-from-cam-json``).
 _PLACEHOLDER_T_EE_CAM_X_M = float(os.environ.get("ZITIBOT_PLACEHOLDER_T_EE_CAM_X_M", "0.00"))
-_PLACEHOLDER_T_EE_CAM_Z_M = float(os.environ.get("ZITIBOT_PLACEHOLDER_T_EE_CAM_Z_M", "-0.1134"))
+_PLACEHOLDER_T_EE_CAM_Z_M = float(os.environ.get("ZITIBOT_PLACEHOLDER_T_EE_CAM_Z_M", "0.00")) # -0.1224
 _PLACEHOLDER_T_EE_CAM_Y_M = float(os.environ.get("ZITIBOT_PLACEHOLDER_T_EE_CAM_Y_M", "0.00"))
 _PLACEHOLDER_T_XYZ_M = (_PLACEHOLDER_T_EE_CAM_X_M, _PLACEHOLDER_T_EE_CAM_Y_M, _PLACEHOLDER_T_EE_CAM_Z_M)
 PLACEHOLDER_T_EE_CAM = np.array(
@@ -93,12 +93,14 @@ def build_prompt(object_name: str | None, custom_prompt: str | None) -> str:
         f"In the image, locate the **{obj}**. Choose **one** point on the **outer rim / lip** "
         f"of the {obj} where a parallel-jaw gripper could make **stable contact** for a pick: "
         "not the flat bottom or deep interior; avoid the table, fingers, or clutter. "
-        "You must pick a point on the **leftmost** part of the bowl rim as seen in the image: "
-        "prefer the rim location with the **smallest normalized x** (farther **left** in the frame; "
-        "x is the second coordinate in [y, x]). Among rim points on that left side that still look "
-        "graspable and on the true bowl rim, choose the clearest one. "
+        "You must pick a point on the **bottom / near** part of the bowl rim as seen in the image — "
+        "the outer rim on the side **closest to the camera** (the near edge, not the far rim). "
+        "Prefer the rim location with the **largest normalized y** (farther **down** in the frame; "
+        "y is the first coordinate in [y, x]). Among rim points along that lower near edge that "
+        "still look graspable and on the true bowl rim, choose the clearest one that appears nearest "
+        "to the viewer. "
         "Use this image convention: normalized **y** grows **downward**; normalized **x** grows **rightward**. "
-        "If the left rim is occluded, choose the leftmost **visible** rim point on the bowl. "
+        "If that near bottom rim is occluded, choose the lowest **visible** near-rim point on the bowl. "
         f"The label should name the object (e.g. \"{obj}\"). "
         "Reply with JSON only in this form: "
         '[{"point": [y, x], "label": <label>}]. '

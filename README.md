@@ -135,3 +135,22 @@ python python_control/vision_controller.py --prompt "Point to the rim of the bow
 ```
 
 Keys (live): **SPACE** = query Gemini, **ENTER** = send cartesian goal, **s** = save overlay, **q** / **Esc** = quit.
+
+### Grasp and pour (Gemini + Franka gripper)
+
+**`ZitiBot/controllers/grasp_and_pour_controller.py`** is the interactive real-robot flow (no mobile base): same Gemini + RealSense UI as `vision_controller.py`, but **ENTER** is two-step — first descend to the latched pick with gripper **open**, then **close**, **lift**, and **pour** (90° about world +Y, ported from `zitibot_mmp_panda/controller.cpp`).
+
+Prerequisites:
+
+- Redis, OpenSai web UI on **`zitibot_panda.xml`**, **`cartesian_controller`** active
+- Franka arm Redis driver and Franka **gripper** driver (`opensai::FrankaRobot::gripper::desired_width`, etc.)
+- RealSense + `GEMINI_API_KEY` (see above)
+
+```bash
+python ZitiBot/controllers/grasp_and_pour_controller.py
+python ZitiBot/controllers/grasp_and_pour_controller.py --lift-dz 0.12 --object bowl
+```
+
+Keys: **SPACE** = Gemini + latch pick | **ENTER** = grasp (open) then lift+pour | **s** = save overlay | **q** / **Esc** = quit.
+
+The sim auto-FSM remains **`launch_zitibot.sh`** / `controller_zitibot_mmp_panda` (C++); use this script on hardware with OpenSai.

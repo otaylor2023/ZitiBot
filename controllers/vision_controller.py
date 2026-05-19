@@ -117,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--object",
         default="bowl",
-        help="Object name in the default bowl-rim prompt (leftmost rim point).",
+        help="Object name in the default bowl-rim prompt (near/bottom rim, closest to camera).",
     )
     p.add_argument(
         "--prompt",
