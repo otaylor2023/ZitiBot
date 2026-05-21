@@ -2,9 +2,8 @@
 """Fixed-pose grasp + transport + place on OpenSai Franka (Redis only).
 
 Pick and place positions are configurable (world frame, meters). End-effector
-orientation stays **fixed** for the whole sequence (same as grasp-and-pour grasp
-pose: tool Z down, 45° yaw). Only position changes between pick, lift, transit,
-and place.
+orientation stays **fixed** for the whole sequence (tool Z down, 45° yaw). Only
+position changes between pick, lift, transit, and place.
 
 Every state transition is **manually gated by ENTER**.
 
@@ -22,7 +21,8 @@ Then one ENTER per step:
 - ``q`` / Ctrl+C — quit.
 
 Requires OpenSai ``cartesian_controller``, Franka arm driver, and Franka gripper
-Redis driver (``opensai::FrankaRobot::gripper::*``).
+Redis driver (``opensai::FrankaRobot::gripper::*``). Also run
+``sai_franka_gripper_redis_driver`` separately from ``launch_driver.sh``.
 
 Usage::
 
@@ -78,9 +78,9 @@ class _RedisKeys(OpenSaiRedisKeys):
 
 
 # Franka gripper driver modes (see drivers/FrankaPanda/redis_driver/gripper.cpp).
-GRIPPER_MODE_MOVE = "m"  # position move (open to desired_width)
-GRIPPER_MODE_GRASP = "g"  # close until contact at desired_force
-GRIPPER_MODE_OPEN_MAX = "o"  # fully open
+GRIPPER_MODE_MOVE = "m"
+GRIPPER_MODE_GRASP = "g"
+GRIPPER_MODE_OPEN_MAX = "o"
 
 _KEYS = _RedisKeys()
 
@@ -97,13 +97,8 @@ EE_ORIENTATION = np.array(
 )
 
 DEFAULT_LIFT_DZ_M = 0.15
-DEFAULT_GRIPPER_SPEED = 0.08
-DEFAULT_GRIPPER_FORCE = 80.0
-# Target opening at grasp (m). 0 = fully closed (small objects). For a pan handle/rim,
-# set ~0.02–0.06 so grasp squeezes at that width instead of slipping on a wide lip.
-DEFAULT_GRIPPER_CLOSE_WIDTH_M = 0.0
-DEFAULT_GRIPPER_PREGRASP_DWELL_S = 0.0
-DEFAULT_GRIPPER_GRASP_DWELL_S = 0.8
+DEFAULT_GRIPPER_SPEED = 0.1
+DEFAULT_GRIPPER_FORCE = 50.0
 POLL_DT_S = 0.05
 
 
@@ -124,8 +119,6 @@ class MotionParams:
     gripper_close_width: float
     gripper_speed: float
     gripper_force: float
-    gripper_pregrasp_dwell_s: float
-    gripper_grasp_dwell_s: float
 
 
 def _decode_redis_value(raw: bytes | str | None) -> str | None:
@@ -188,17 +181,6 @@ def _publish_cartesian(
         _KEYS.cartesian_task_goal_orientation,
         json.dumps(np.asarray(goal_ori, dtype=np.float64).reshape(3, 3).tolist()),
     )
-
-
-def read_gripper_current_width(redis_client) -> float | None:
-    raw = redis_client.get(_KEYS.gripper_current_width)
-    text = _decode_redis_value(raw)
-    if text is None:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
 
 
 def read_gripper_max_width(redis_client) -> float | None:
@@ -264,42 +246,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Open width (m); default reads gripper::max_width from Redis.",
     )
-    p.add_argument(
-        "--gripper-close-width",
-        type=float,
-        default=DEFAULT_GRIPPER_CLOSE_WIDTH_M,
-        help=(
-            "Pre-close finger opening (m) via move mode before grasp. "
-            "0 = grasp only. For pans, try 0.03–0.06 on the handle/rim."
-        ),
-    )
+    p.add_argument("--gripper-close-width", type=float, default=0.0)
     p.add_argument("--gripper-speed", type=float, default=DEFAULT_GRIPPER_SPEED)
-    p.add_argument(
-        "--gripper-force",
-        type=float,
-        default=DEFAULT_GRIPPER_FORCE,
-        help="Grasp force (N). Heavy pans often need 100–140.",
-    )
-    p.add_argument(
-        "--gripper-pregrasp-dwell",
-        type=float,
-        default=DEFAULT_GRIPPER_PREGRASP_DWELL_S,
-        help="Seconds to wait after optional pre-close move (if close-width > 0).",
-    )
-    p.add_argument(
-        "--gripper-grasp-dwell",
-        type=float,
-        default=DEFAULT_GRIPPER_GRASP_DWELL_S,
-        help="Seconds to hold after grasp before you lift (ENTER step 3).",
-    )
-    p.add_argument(
-        "--heavy",
-        action="store_true",
-        help=(
-            "Preset for heavy/wide objects (pan): force=120 N, speed=0.05, "
-            "close-width=0.04 m, pregrasp dwell=0.6 s, grasp dwell=1.2 s."
-        ),
-    )
+    p.add_argument("--gripper-force", type=float, default=DEFAULT_GRIPPER_FORCE)
     return p.parse_args()
 
 
@@ -359,40 +308,17 @@ def _do_descend(
 
 
 def _do_close_gripper(redis_client, motion: MotionParams) -> None:
-    target_w = float(motion.gripper_close_width)
-    if target_w > 0.0 and motion.gripper_pregrasp_dwell_s > 0.0:
-        set_gripper_width(
-            redis_client,
-            target_w,
-            speed=motion.gripper_speed,
-            force=motion.gripper_force,
-            mode=GRIPPER_MODE_MOVE,
-        )
-        print(
-            f"[2a] Pre-close (move): width={target_w:.4f} m, "
-            f"dwell={motion.gripper_pregrasp_dwell_s:.1f} s"
-        )
-        time.sleep(motion.gripper_pregrasp_dwell_s)
-
     set_gripper_width(
         redis_client,
-        target_w,
+        motion.gripper_close_width,
         speed=motion.gripper_speed,
         force=motion.gripper_force,
         mode=GRIPPER_MODE_GRASP,
     )
     print(
-        f"[2] Grasp: target width={target_w:.4f} m, force={motion.gripper_force:.1f} N, "
+        f"[2] Close gripper (grasp): force={motion.gripper_force:.1f} N, "
         f"speed={motion.gripper_speed:.3f} m/s (mode=g)"
     )
-    if motion.gripper_grasp_dwell_s > 0.0:
-        time.sleep(motion.gripper_grasp_dwell_s)
-        cur = read_gripper_current_width(redis_client)
-        if cur is not None:
-            print(f"     After dwell: gripper current_width={cur:.4f} m")
-        print(
-            "     Wait until the pan feels secure, then ENTER to lift."
-        )
 
 
 def _do_lift(
@@ -447,15 +373,12 @@ def run_loop(
         gripper_close_width=motion.gripper_close_width,
         gripper_speed=motion.gripper_speed,
         gripper_force=motion.gripper_force,
-        gripper_pregrasp_dwell_s=motion.gripper_pregrasp_dwell_s,
-        gripper_grasp_dwell_s=motion.gripper_grasp_dwell_s,
     )
     ee_ori = EE_ORIENTATION.copy()
 
     print(
         f"Motion: lift_dz={motion.lift_dz_m} m, "
         f"gripper open={motion.gripper_open_width:.4f} m, "
-        f"grasp width={motion.gripper_close_width:.4f} m, "
         f"force={motion.gripper_force:.0f} N"
     )
     print(
@@ -548,32 +471,12 @@ def main() -> int:
     pick_pos = np.array(args.pick, dtype=np.float64).reshape(3)
     place_pos = np.array(args.place, dtype=np.float64).reshape(3)
 
-    gripper_force = args.gripper_force
-    gripper_speed = args.gripper_speed
-    gripper_close_width = args.gripper_close_width
-    pregrasp_dwell = args.gripper_pregrasp_dwell
-    grasp_dwell = args.gripper_grasp_dwell
-    if args.heavy:
-        gripper_force = max(gripper_force, 120.0)
-        gripper_speed = min(gripper_speed, 0.05)
-        if gripper_close_width <= 0.0:
-            gripper_close_width = 0.04
-        pregrasp_dwell = max(pregrasp_dwell, 0.6)
-        grasp_dwell = max(grasp_dwell, 1.2)
-        print(
-            "Using --heavy preset: "
-            f"force={gripper_force} N, speed={gripper_speed}, "
-            f"close-width={gripper_close_width} m"
-        )
-
     motion = MotionParams(
         lift_dz_m=args.lift_dz,
         gripper_open_width=args.gripper_open_width,
-        gripper_close_width=gripper_close_width,
-        gripper_speed=gripper_speed,
-        gripper_force=gripper_force,
-        gripper_pregrasp_dwell_s=pregrasp_dwell,
-        gripper_grasp_dwell_s=grasp_dwell,
+        gripper_close_width=args.gripper_close_width,
+        gripper_speed=args.gripper_speed,
+        gripper_force=args.gripper_force,
     )
     return run_loop(redis_client, motion, pick_pos, place_pos)
 
