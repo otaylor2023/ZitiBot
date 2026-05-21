@@ -14,6 +14,13 @@ only — not ``base_controller.py`` as a separate process).
   Motive axes, body-frame goals use the Opti quaternion. Hb yaw is not used for
   mapping (only held fixed on ``hb1::desired_pose``).
 
+  Motive's rigid-body local +X is auto-assigned from the marker layout and is
+  generally **not** the robot's actual forward direction. We capture that
+  mismatch with ``--marker-yaw-offset-deg`` (mocap_yaw_marker = body_yaw_in_opti
+  + offset, CCW positive). With that set, ``calib.rot = R(-body_yaw_in_opti)``
+  maps Opti-world delta vectors straight into the hb (body) world. The log
+  block prints a live empirical estimate so you can dial in the right value.
+
 **Units**
 
 - Base / Redis driver: **m**, **rad**, **m/s**, **rad/s** (see ``Vehicle`` in
@@ -26,8 +33,8 @@ only — not ``base_controller.py`` as a separate process).
 
 **Goals**
 
-- Absolute (default): Motive position ``(-1.5, 1.0, 0.45)`` m, straight-line drive at
-  startup heading (no orientation change). Optional ``--target-yaw-deg``.
+- Absolute (default): Motive position ``(-1.5, 1.0, 0.45)`` m, target yaw 90 deg
+  (marker +X along Motive +Y). Pass ``--no-target-yaw`` to hold startup heading.
 - Relative: ``--relative-goal`` then ``--goal-along lab-plus-y`` (default 1.5 ft), etc.
 
 Lab→hb uses **Opti orientation only**: hb odom +X is marker +X in the lab at startup
@@ -55,16 +62,46 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import ast
-import enum
-import json
 import math
 import sys
 import time
-from dataclasses import dataclass
 
 import numpy as np
 import redis
+
+from tidybot_base.mocap import (
+    MocapRedisKeys,
+    read_mocap_pose,
+    read_tracking_valid,
+    wait_for_tracking_valid,
+)
+from tidybot_base.opti_planner import (
+    GOAL_ALONG_AXES,
+    LAB_AXIS_YAW_RAD,
+    ROBOT_FRAME_ROT_DEG,
+    GoalFrame,
+    RunPlan,
+    mocap_pose_error,
+    mocap_pose_to_hb_se2,
+    opti_body_yaw_error_rad,
+    opti_xy_distance_m,
+    replan_hb_goal_from_opti,
+    setup_run_plan,
+    waypoint_reached,
+)
+from tidybot_base.redis_io import (
+    BaseRedisKeys,
+    connect_redis,
+    read_robot_se2,
+    stop_base,
+    write_desired_pose,
+)
+from tidybot_base.se2 import (
+    hb1_tracking_error,
+    quat_xyzw_to_yaw,
+    rot2d_yaw,
+    wrap_angle,
+)
 
 FEET_TO_METERS = 0.3048
 INCHES_TO_METERS = 0.0254
@@ -76,561 +113,12 @@ DEFAULT_TOLERANCE_IN = 1.0
 DEFAULT_TARGET_X = -1.5
 DEFAULT_TARGET_Y = 1.0
 DEFAULT_TARGET_Z = 0.45
-# Always applied when mapping Opti goals → hb commands (translation and yaw).
-ROBOT_FRAME_ROT_DEG = 45.0
+DEFAULT_TARGET_YAW_DEG: float | None = 90.0  # Motive lab heading for marker +X; None = hold startup
 DEFAULT_FACE_LAB_YAW = "minus-y"  # after translation, rotate to face this Motive lab axis
 DEFAULT_YAW_TOLERANCE_DEG = 5.0
 
-# Marker +X in Motive lab points along this axis (rad).
-LAB_AXIS_YAW_RAD: dict[str, float] = {
-    "plus-x": 0.0,
-    "minus-x": math.pi,
-    "plus-y": math.pi / 2.0,
-    "minus-y": -math.pi / 2.0,
-}
-
-
-class GoalFrame(enum.Enum):
-    """How goal deltas are interpreted at startup (Opti only)."""
-
-    OPTI_BODY = "opti_body"  # rigid-body / marker XY (from Opti quaternion)
-    OPTI_WORLD = "opti_world"  # Motive lab X/Y on the floor
-
-
-# Unit axis in the selected frame; multiplied by --goal-distance-ft (positive distance).
-GOAL_ALONG_AXES: dict[str, tuple[GoalFrame, tuple[float, float]]] = {
-    "lab-minus-x": (GoalFrame.OPTI_WORLD, (-1.0, 0.0)),
-    "lab-plus-x": (GoalFrame.OPTI_WORLD, (1.0, 0.0)),
-    "lab-minus-y": (GoalFrame.OPTI_WORLD, (0.0, -1.0)),
-    "lab-plus-y": (GoalFrame.OPTI_WORLD, (0.0, 1.0)),
-    "body-minus-x": (GoalFrame.OPTI_BODY, (-1.0, 0.0)),
-    "body-plus-x": (GoalFrame.OPTI_BODY, (1.0, 0.0)),
-    "body-minus-y": (GoalFrame.OPTI_BODY, (0.0, -1.0)),
-    "body-plus-y": (GoalFrame.OPTI_BODY, (0.0, 1.0)),
-}
-
-
-@dataclass(frozen=True)
-class RedisKeys:
-    # OptiTrack / mocap (external tracking)
-    mocap_pos: str = "tidybot01::pos"
-    mocap_ori: str = "tidybot01::ori"
-    tracking_valid: str = "tidybot01::tracking_valid"
-    # TidyBot base odometry + commands (redis_driver / Vehicle)
-    robot_pose: str = "hb1::current_pose"
-    robot_vel: str = "hb1::current_vel"
-    desired_pose: str = "hb1::desired_pose"
-    stop: str = "hb1::stop"
-
-
-KEYS = RedisKeys()
-
-
-@dataclass(frozen=True)
-class MocapToHbCalib:
-    """SE(2) calibration: mocap XY (OptiTrack world) → hb1 odom XY."""
-
-    rot: np.ndarray  # 2×2, p_hb = rot @ p_mocap + trans
-    trans: np.ndarray  # length 2
-    mocap_rot: np.ndarray  # 2×2 horizontal rotation from mocap quaternion
-    mocap_start_yaw: float
-
-
-@dataclass
-class RunPlan:
-    """Mocap goal plus hb waypoints (cardinal hb motion or single straight goal)."""
-
-    desired_mocap_xyz: np.ndarray
-    desired_mocap_yaw: float
-    mocap_start_xyz: np.ndarray
-    mocap_start_yaw: float
-    goal_delta_input_xy: np.ndarray  # meters, in frame given by goal_frame
-    goal_frame: GoalFrame
-    mocap_delta_world_xy: np.ndarray  # Opti/lab goal delta (no robot-frame rot)
-    mocap_delta_rotated_xy: np.ndarray  # after robot-frame rot → mapped to hb
-    hb_delta_xy: np.ndarray
-    robot_start: np.ndarray
-    robot_target: np.ndarray  # final hb1 [x, y, yaw]
-    face_lab_yaw: str | None  # e.g. minus-y, or None
-    hb_target_yaw: float
-    hb_waypoints: list[np.ndarray]  # intermediate + final poses for redis
-    calib: MocapToHbCalib
-    robot_input_rot_deg: float
-    mocap_delta_before_robot_rot_xy: np.ndarray
-    absolute_target: bool  # desired mocap pose given explicitly (not axis delta)
-    require_final_yaw: bool  # success checks hb yaw vs target
-
-
-def numpy_array_to_string(array: np.ndarray) -> str:
-    if isinstance(array, np.ndarray) and array.ndim == 1:
-        return "[" + ", ".join(map(str, array.tolist())) + "]"
-    return ""
-
-
-def parse_redis_list(raw: bytes | str | None) -> np.ndarray | None:
-    if raw is None:
-        return None
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
-    raw = raw.strip()
-    if raw.startswith("["):
-        try:
-            values = ast.literal_eval(raw)
-            if isinstance(values, list):
-                return np.array(values, dtype=np.float64)
-        except (SyntaxError, ValueError):
-            pass
-    try:
-        values = json.loads(raw)
-        if isinstance(values, list):
-            return np.array(values, dtype=np.float64)
-    except json.JSONDecodeError:
-        pass
-    return None
-
-
-def wrap_angle(angle: float) -> float:
-    return (angle + math.pi) % (2.0 * math.pi) - math.pi
-
-
-def quat_xyzw_to_yaw(q: np.ndarray) -> float:
-    """Heading from body +X projected onto the horizontal plane (rad)."""
-    return rot2d_yaw(quat_xyzw_to_rot2d(q))
-
-
-def quat_xyzw_to_rot2d(q: np.ndarray) -> np.ndarray:
-    """Horizontal 2×2 rotation from quaternion (xyzw)."""
-    x, y, z, w = (float(q[i]) for i in range(4))
-    return np.array(
-        [
-            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z)],
-            [2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z)],
-        ],
-        dtype=np.float64,
-    )
-
-
-def rot2d_from_yaw(yaw: float) -> np.ndarray:
-    c, s = math.cos(yaw), math.sin(yaw)
-    return np.array([[c, -s], [s, c]], dtype=np.float64)
-
-
-def rot2d_yaw(rot: np.ndarray) -> float:
-    return math.atan2(float(rot[1, 0]), float(rot[0, 0]))
-
-
-def parse_tracking_valid(raw: bytes | str | None) -> bool:
-    """Interpret Redis ``tidybot01::tracking_valid`` (true/1/yes/on)."""
-    if raw is None:
-        return False
-    s = str(raw).strip().lower()
-    if s in ("true", "1", "yes", "on"):
-        return True
-    if s in ("false", "0", "no", "off", ""):
-        return False
-    try:
-        return bool(int(float(s)))
-    except ValueError:
-        return False
-
-
-def read_tracking_valid(client: redis.Redis, key: str | None = None) -> bool:
-    return parse_tracking_valid(client.get(key or KEYS.tracking_valid))
-
-
-def stop_base(client: redis.Redis) -> None:
-    """Tell redis_driver to decelerate and hold current pose."""
-    client.set(KEYS.stop, "stop")
-
-
-def wait_for_tracking_valid(
-    client: redis.Redis,
-    key: str,
-    *,
-    poll_hz: float = 10.0,
-) -> None:
-    period = 1.0 / max(poll_hz, 0.1)
-    last_msg = 0.0
-    print(f"Waiting for {key!r} == true before planning or motion...")
-    while True:
-        if read_tracking_valid(client, key):
-            print(f"{key} is true — proceeding.")
-            return
-        now = time.perf_counter()
-        if now - last_msg >= 2.0:
-            raw = client.get(key)
-            print(f"  still waiting ({key}={raw!r})")
-            last_msg = now
-        time.sleep(period)
-
-
-def connect_redis(host: str, port: int) -> redis.Redis:
-    client = redis.Redis(host=host, port=port, decode_responses=True)
-    client.ping()
-    return client
-
-
-def read_robot_se2(client: redis.Redis, pose_key: str | None = None) -> np.ndarray:
-    key = pose_key or KEYS.robot_pose
-    pos = parse_redis_list(client.get(key))
-    if pos is None or pos.size < 3:
-        raise RuntimeError(f"Invalid {key!r} (need [x, y, yaw])")
-    return pos[:3].astype(np.float64)
-
-
-def read_mocap_pose(
-    client: redis.Redis,
-    pos_key: str | None = None,
-    ori_key: str | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    pk = pos_key or KEYS.mocap_pos
-    ok = ori_key or KEYS.mocap_ori
-    pos = parse_redis_list(client.get(pk))
-    ori = parse_redis_list(client.get(ok))
-    if pos is None or pos.size < 3:
-        raise RuntimeError(f"Missing or invalid {pk!r} (is OptiTrack on Redis?)")
-    if ori is None or ori.size < 4:
-        raise RuntimeError(f"Missing or invalid {ok!r}")
-    return pos[:3].astype(np.float64), ori[:4].astype(np.float64)
-
-
-def calibrate_mocap_to_hb(
-    robot_start: np.ndarray,
-    mocap_xyz: np.ndarray,
-    mocap_quat: np.ndarray,
-    *,
-    translation_only: bool = False,
-    calib_yaw_deg: float | None = None,
-) -> MocapToHbCalib:
-    """Fit ``p_hb = R @ p_mocap + t`` at startup (Opti orientation is ground truth).
-
-    Default: ``R = R_mocap^T`` so hb odom +X matches marker +X in Motive at power-on.
-    Hb ``current_pose`` yaw is not used. Use ``translation_only`` if Motive XY = hb XY.
-    """
-    mocap_rot = quat_xyzw_to_rot2d(mocap_quat)
-    mocap_yaw = rot2d_yaw(mocap_rot)
-    if calib_yaw_deg is not None:
-        rot = rot2d_from_yaw(math.radians(calib_yaw_deg))
-    elif translation_only:
-        rot = np.eye(2, dtype=np.float64)
-    else:
-        rot = mocap_rot.T
-    trans = robot_start[:2] - rot @ _xy2(mocap_xyz)
-    return MocapToHbCalib(
-        rot=rot,
-        trans=trans,
-        mocap_rot=mocap_rot,
-        mocap_start_yaw=mocap_yaw,
-    )
-
-
-def mocap_lab_yaw_to_hb_yaw(
-    desired_mocap_yaw: float,
-    mocap_start_yaw: float,
-    robot_start_yaw: float,
-    robot_frame_rot_deg: float = ROBOT_FRAME_ROT_DEG,
-) -> float:
-    """Hb odom yaw for a Motive lab heading + fixed robot-frame rotation offset."""
-    hb_yaw = float(robot_start_yaw) + wrap_angle(desired_mocap_yaw - mocap_start_yaw)
-    return wrap_angle(hb_yaw + math.radians(robot_frame_rot_deg))
-
-
-def build_hb_waypoints(
-    robot_start: np.ndarray,
-    robot_target: np.ndarray,
-    *,
-    cardinal_hb: bool,
-    direct_motion: bool = True,
-    straight_line: bool = False,
-) -> list[np.ndarray]:
-    """Build hb1 desired_pose waypoints.
-
-    ``straight_line=True``: one goal ``[x, y, start_yaw]`` — planar straight segment,
-    no heading change (default for absolute position-only goals).
-
-    ``direct_motion=True``: one holonomic goal ``[x, y, yaw]`` (XY + heading together).
-
-    With ``direct_motion=False``: translate at start yaw, then rotate in place.
-    With ``cardinal_hb`` (and not direct): L-path in hb odom (X corner, then Y).
-    """
-    final = np.asarray(robot_target, dtype=np.float64).reshape(3)
-    hold_yaw = float(robot_start[2])
-    final_yaw = float(final[2])
-    dx = final[0] - robot_start[0]
-    dy = final[1] - robot_start[1]
-    translate_xy = abs(dx) > 1e-4 or abs(dy) > 1e-4
-    rotate_yaw = abs(wrap_angle(final_yaw - hold_yaw)) > 1e-3
-
-    if not translate_xy and not rotate_yaw:
-        return []
-
-    if straight_line:
-        return [np.array([final[0], final[1], hold_yaw], dtype=np.float64)]
-
-    if direct_motion:
-        return [final]
-
-    trans_xy = np.array([final[0], final[1], hold_yaw], dtype=np.float64)
-    waypoints: list[np.ndarray] = []
-    if cardinal_hb and abs(dx) > 1e-4 and abs(dy) > 1e-4:
-        corner = np.array([final[0], robot_start[1], hold_yaw], dtype=np.float64)
-        waypoints.append(corner)
-    if rotate_yaw and not translate_xy:
-        return [final]
-    waypoints.append(trans_xy)
-    if rotate_yaw:
-        waypoints.append(final)
-    return waypoints
-
-
-def waypoint_reached(
-    robot_current: np.ndarray,
-    waypoint: np.ndarray,
-    waypoint_idx: int,
-    waypoints: list[np.ndarray],
-    *,
-    tolerance_m: float,
-    tolerance_yaw_rad: float,
-) -> bool:
-    """Last waypoint needs XY + yaw; earlier ones only XY (in-place turn is separate)."""
-    if float(np.linalg.norm(robot_current[:2] - waypoint[:2])) >= tolerance_m:
-        return False
-    is_last = waypoint_idx >= len(waypoints) - 1
-    if not is_last:
-        return True
-    return abs(wrap_angle(float(robot_current[2]) - float(waypoint[2]))) < tolerance_yaw_rad
-
-
-def _xy2(arr: np.ndarray) -> np.ndarray:
-    """First two elements of a position (accepts xy or xyz)."""
-    flat = np.asarray(arr, dtype=np.float64).ravel()
-    if flat.size < 2:
-        raise ValueError(f"need at least 2 position components, got {flat.size}")
-    return flat[:2]
-
-
-def mocap_xy_to_hb(mocap_xy: np.ndarray, calib: MocapToHbCalib) -> np.ndarray:
-    return calib.rot @ _xy2(mocap_xy) + calib.trans
-
-
-def mocap_pose_to_hb_se2(
-    mocap_xyz: np.ndarray,
-    calib: MocapToHbCalib,
-    hb_yaw_hold: float,
-) -> np.ndarray:
-    """Map Opti position into hb1 XY; keep hb yaw fixed (not commanded from Opti)."""
-    hb_xy = mocap_xy_to_hb(mocap_xyz, calib)
-    return np.array([hb_xy[0], hb_xy[1], hb_yaw_hold], dtype=np.float64)
-
-
-def rotate_vector_in_robot_frame(
-    v_xy: np.ndarray,
-    robot_yaw: float,
-    rot_deg: float,
-) -> np.ndarray:
-    """Rotate a planar vector by ``rot_deg`` about the robot/hb z axis at ``robot_yaw``."""
-    if abs(rot_deg) < 1e-9:
-        return _xy2(v_xy)
-    r_h = rot2d_from_yaw(float(robot_yaw))
-    r_d = rot2d_from_yaw(math.radians(rot_deg))
-    return r_h @ r_d @ r_h.T @ _xy2(v_xy)
-
-
-def plan_translation(
-    mocap_xyz: np.ndarray,
-    calib: MocapToHbCalib,
-    goal_delta_input_xy: np.ndarray,
-    goal_frame: GoalFrame,
-    robot_yaw: float,
-    robot_input_rot_deg: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return (desired_mocap_xyz, mocap_goal_delta, hb_delta, mocap_delta_rotated)."""
-    delta_in = _xy2(goal_delta_input_xy)
-    if goal_frame == GoalFrame.OPTI_BODY:
-        mocap_goal_delta = calib.mocap_rot @ delta_in
-    else:
-        mocap_goal_delta = delta_in
-    mocap_rotated = rotate_vector_in_robot_frame(
-        mocap_goal_delta, robot_yaw, robot_input_rot_deg
-    )
-    hb_delta = calib.rot @ mocap_rotated
-
-    desired_xyz = mocap_xyz.copy()
-    desired_xyz[:2] = _xy2(mocap_xyz) + mocap_goal_delta
-    return desired_xyz, mocap_goal_delta, hb_delta, mocap_rotated
-
-
-def plan_absolute_mocap_goal(
-    mocap_xyz: np.ndarray,
-    desired_mocap_xyz: np.ndarray,
-    calib: MocapToHbCalib,
-    robot_yaw: float,
-    robot_input_rot_deg: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return (desired_mocap_xyz, mocap_goal_delta, hb_delta, mocap_delta_rotated)."""
-    desired_xyz = np.asarray(desired_mocap_xyz, dtype=np.float64).reshape(3)
-    mocap_goal_delta = _xy2(desired_xyz) - _xy2(mocap_xyz)
-    mocap_rotated = rotate_vector_in_robot_frame(
-        mocap_goal_delta, robot_yaw, robot_input_rot_deg
-    )
-    hb_delta = calib.rot @ mocap_rotated
-    return desired_xyz, mocap_goal_delta, hb_delta, mocap_rotated
-
-
-def setup_run_plan(
-    client: redis.Redis,
-    *,
-    goal_delta_input_xy: np.ndarray,
-    goal_frame: GoalFrame,
-    translation_only_calib: bool,
-    calib_yaw_deg: float | None,
-    cardinal_hb: bool,
-    direct_motion: bool,
-    robot_input_rot_deg: float,
-    face_lab_yaw: str | None,
-    robot_pose_key: str,
-    mocap_pos_key: str,
-    mocap_ori_key: str,
-    curr_minus_desired: bool,
-    absolute_mocap_target: tuple[np.ndarray, float | None] | None = None,
-) -> RunPlan:
-    robot_start = read_robot_se2(client, robot_pose_key)
-    mocap_xyz, mocap_quat = read_mocap_pose(client, mocap_pos_key, mocap_ori_key)
-    mocap_yaw = quat_xyzw_to_yaw(mocap_quat)
-    calib = calibrate_mocap_to_hb(
-        robot_start,
-        mocap_xyz,
-        mocap_quat,
-        translation_only=translation_only_calib,
-        calib_yaw_deg=calib_yaw_deg,
-    )
-
-    absolute_target = absolute_mocap_target is not None
-    target_yaw_rad: float | None = None
-    if absolute_target:
-        desired_xyz_in, target_yaw_rad = absolute_mocap_target
-        desired_xyz, mocap_goal_delta, hb_delta, mocap_rotated = plan_absolute_mocap_goal(
-            mocap_xyz,
-            desired_xyz_in,
-            calib,
-            float(robot_start[2]),
-            robot_input_rot_deg,
-        )
-        goal_delta = mocap_goal_delta
-        goal_frame = GoalFrame.OPTI_WORLD
-        face_lab_yaw = None
-        if target_yaw_rad is None:
-            desired_mocap_yaw = mocap_yaw
-            hb_target_yaw = float(robot_start[2])
-            require_final_yaw = False
-        else:
-            desired_mocap_yaw = target_yaw_rad
-            hb_target_yaw = mocap_lab_yaw_to_hb_yaw(
-                desired_mocap_yaw,
-                mocap_yaw,
-                float(robot_start[2]),
-                robot_input_rot_deg,
-            )
-            require_final_yaw = True
-    else:
-        goal_delta = _xy2(goal_delta_input_xy)
-        desired_xyz, mocap_goal_delta, hb_delta, mocap_rotated = plan_translation(
-            mocap_xyz,
-            calib,
-            goal_delta,
-            goal_frame,
-            float(robot_start[2]),
-            robot_input_rot_deg,
-        )
-        if face_lab_yaw is not None:
-            desired_mocap_yaw = LAB_AXIS_YAW_RAD[face_lab_yaw]
-            require_final_yaw = True
-        else:
-            desired_mocap_yaw = mocap_yaw
-            require_final_yaw = False
-        hb_target_yaw = mocap_lab_yaw_to_hb_yaw(
-            desired_mocap_yaw,
-            mocap_yaw,
-            float(robot_start[2]),
-            robot_input_rot_deg,
-        )
-    robot_target = np.array(
-        [
-            robot_start[0] + hb_delta[0],
-            robot_start[1] + hb_delta[1],
-            hb_target_yaw,
-        ],
-        dtype=np.float64,
-    )
-    straight_line = absolute_target and target_yaw_rad is None
-    hb_waypoints = build_hb_waypoints(
-        robot_start,
-        robot_target,
-        cardinal_hb=cardinal_hb,
-        direct_motion=direct_motion and not straight_line,
-        straight_line=straight_line,
-    )
-
-    # curr_minus_desired only affects mocap error logging, not hb target mapping
-    _ = curr_minus_desired
-
-    return RunPlan(
-        desired_mocap_xyz=desired_xyz,
-        desired_mocap_yaw=desired_mocap_yaw,
-        mocap_start_xyz=mocap_xyz,
-        mocap_start_yaw=mocap_yaw,
-        goal_delta_input_xy=goal_delta,
-        goal_frame=goal_frame,
-        mocap_delta_world_xy=mocap_goal_delta,
-        mocap_delta_rotated_xy=mocap_rotated,
-        hb_delta_xy=hb_delta,
-        robot_start=robot_start,
-        robot_target=robot_target,
-        face_lab_yaw=face_lab_yaw,
-        hb_target_yaw=hb_target_yaw,
-        hb_waypoints=hb_waypoints,
-        calib=calib,
-        robot_input_rot_deg=robot_input_rot_deg,
-        mocap_delta_before_robot_rot_xy=mocap_goal_delta,
-        absolute_target=absolute_target,
-        require_final_yaw=require_final_yaw,
-    )
-
-
-def hb1_tracking_error(robot_current: np.ndarray, robot_target: np.ndarray) -> np.ndarray:
-    """Error in hb1 odom: current minus target."""
-    return np.array(
-        [
-            robot_current[0] - robot_target[0],
-            robot_current[1] - robot_target[1],
-            wrap_angle(robot_current[2] - robot_target[2]),
-        ],
-        dtype=np.float64,
-    )
-
-
-def mocap_pose_error(
-    current_xyz: np.ndarray,
-    current_yaw: float,
-    desired_xyz: np.ndarray,
-    desired_yaw: float,
-    *,
-    curr_minus_desired: bool,
-) -> np.ndarray:
-    """Error in mocap frame: [dx, dy, dz, dyaw] (m, m, m, rad)."""
-    cur = np.asarray(current_xyz, dtype=np.float64).reshape(3)
-    des = np.asarray(desired_xyz, dtype=np.float64).reshape(3)
-    if curr_minus_desired:
-        dxyz = cur - des
-        dyaw = wrap_angle(current_yaw - desired_yaw)
-    else:
-        dxyz = des - cur
-        dyaw = wrap_angle(desired_yaw - current_yaw)
-    return np.array([dxyz[0], dxyz[1], dxyz[2], dyaw], dtype=np.float64)
-
-
-def write_desired_pose(client: redis.Redis, goal_se2: np.ndarray) -> None:
-    client.set(KEYS.desired_pose, numpy_array_to_string(goal_se2.reshape(3)))
+BASE_KEYS = BaseRedisKeys()
+MOCAP_KEYS = MocapRedisKeys()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -729,22 +217,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--robot-pose-key",
-        default=KEYS.robot_pose,
+        default=BASE_KEYS.robot_pose,
         help="Redis key for robot odom [x, y, yaw] (default: hb1::current_pose)",
     )
     p.add_argument(
         "--mocap-pos-key",
-        default=KEYS.mocap_pos,
+        default=MOCAP_KEYS.pos,
         help="Redis key for mocap position xyz (default: tidybot01::pos)",
     )
     p.add_argument(
         "--mocap-ori-key",
-        default=KEYS.mocap_ori,
+        default=MOCAP_KEYS.ori,
         help="Redis key for mocap orientation xyzw (default: tidybot01::ori)",
     )
     p.add_argument(
         "--tracking-valid-key",
-        default=KEYS.tracking_valid,
+        default=MOCAP_KEYS.tracking_valid,
         help="Redis key; must be true to plan/move (default: tidybot01::tracking_valid)",
     )
     p.add_argument(
@@ -778,18 +266,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--translate-then-rotate",
         action="store_true",
+        default=True,
         help=(
-            "Translate at startup yaw, then rotate in place (old behavior). "
-            "Default is direct holonomic motion to final [x, y, yaw]."
+            "Translate at startup yaw, then rotate in place (default). "
+            "Pass --direct-motion to drive XY + yaw simultaneously."
         ),
     )
     p.add_argument(
+        "--direct-motion",
+        action="store_true",
+        help="Direct holonomic motion to final [x, y, yaw] in a single waypoint",
+    )
+    p.add_argument(
+        "--no-replan",
+        action="store_true",
+        help=(
+            "Disable per-loop hb-goal recomputation from live Opti. Default: "
+            "replan each loop so hb_goal = hb_current + calib.rot @ "
+            "(opti_target_xy − opti_current_xy) for XY (and "
+            "hb_current_yaw + wrap(target_marker_yaw − marker_yaw_now) at the "
+            "final waypoint when yaw is required). Falls back to the fixed "
+            "startup hb waypoints on cycles where Opti is unavailable."
+        ),
+    )
+    p.add_argument(
+        "--marker-yaw-offset-deg",
         "--robot-input-rot-deg",
+        dest="marker_yaw_offset_deg",
         type=float,
         default=ROBOT_FRAME_ROT_DEG,
         help=(
-            "Rotation (deg) applied in hb/robot frame to translation and yaw commands "
-            f"(default: {ROBOT_FRAME_ROT_DEG}, always on)"
+            "Marker → body yaw offset (deg, CCW positive). "
+            "mocap_yaw_marker = body_yaw_in_opti + marker_yaw_offset_deg. "
+            "Set this to compensate when the Motive rigid body's local +X is "
+            "rotated from the robot's actual driving +X. Default: "
+            f"{ROBOT_FRAME_ROT_DEG}. Use the live 'marker_offset_est_deg' "
+            "line in the log block to dial in the right value after one run."
         ),
     )
     p.add_argument(
@@ -830,11 +342,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--target-yaw-deg",
         type=float,
-        default=None,
+        default=DEFAULT_TARGET_YAW_DEG,
         help=(
-            "Absolute Motive lab heading for marker +X (deg). "
-            "Omitted by default: hold startup heading (straight-line XY only)."
+            "Absolute Motive lab heading for the cart's **body** +X (deg, the "
+            "actual driving direction). The marker yaw goal is derived as "
+            "body_yaw + marker_yaw_offset_deg internally. "
+            f"Default: {DEFAULT_TARGET_YAW_DEG} deg. "
+            "Pass --no-target-yaw to hold startup heading instead."
         ),
+    )
+    p.add_argument(
+        "--no-target-yaw",
+        action="store_true",
+        help="Hold startup heading (straight-line XY only); ignores --target-yaw-deg",
     )
     p.add_argument(
         "--target-opti-pose",
@@ -896,6 +416,36 @@ def _fmt_opti_error(err_xyz_yaw: np.ndarray) -> str:
     )
 
 
+def _empirical_marker_offset_deg(
+    plan: RunPlan,
+    robot_current: np.ndarray,
+    mocap_xyz: np.ndarray,
+    *,
+    min_motion_m: float = 0.10,
+    max_hb_yaw_change_rad: float = math.radians(2.0),
+) -> float | None:
+    """Compare hb motion to Opti motion to back out the body yaw in Opti world.
+
+    Returns ``mocap_yaw_start - observed_body_yaw_in_opti`` (deg), which is the
+    marker mounting offset (CCW positive). Skips estimation once the body has
+    rotated more than ``max_hb_yaw_change_rad`` from its startup yaw — during
+    pivot-in-place the marker can slide a few mm from wheel slip, biasing the
+    estimate. Returns ``None`` when motion is too small or the body is no
+    longer at its startup heading.
+    """
+    if abs(wrap_angle(float(robot_current[2]) - float(plan.robot_start[2]))) > max_hb_yaw_change_rad:
+        return None
+    hb_dx = float(robot_current[0]) - float(plan.robot_start[0])
+    hb_dy = float(robot_current[1]) - float(plan.robot_start[1])
+    op_dx = float(mocap_xyz[0]) - float(plan.mocap_start_xyz[0])
+    op_dy = float(mocap_xyz[1]) - float(plan.mocap_start_xyz[1])
+    if math.hypot(hb_dx, hb_dy) < min_motion_m or math.hypot(op_dx, op_dy) < min_motion_m:
+        return None
+    body_yaw_obs = math.atan2(op_dy, op_dx) - math.atan2(hb_dy, hb_dx)
+    offset = wrap_angle(plan.mocap_start_yaw - body_yaw_obs)
+    return math.degrees(offset)
+
+
 def print_pose_log_block(
     *,
     plan: RunPlan,
@@ -915,9 +465,16 @@ def print_pose_log_block(
     print(f"hb_final={_fmt_array(plan.robot_target)}")
     print(f"hb_error={_fmt_array(hb_err)}")
 
-    print(f"opti_start {_fmt_opti_pose(plan.mocap_start_xyz, plan.mocap_start_yaw)}")
+    body_yaw_label = "body" if plan.marker_yaw_offset_deg else "body=marker"
+    print(
+        f"opti_start  marker {_fmt_opti_pose(plan.mocap_start_xyz, plan.mocap_start_yaw)}  "
+        f"{body_yaw_label}_yaw_deg={math.degrees(plan.body_start_yaw_in_opti):.2f}"
+    )
     if mocap_xyz is not None and mocap_quat is not None:
         mocap_yaw = quat_xyzw_to_yaw(mocap_quat)
+        body_yaw_cur = wrap_angle(
+            mocap_yaw - math.radians(plan.marker_yaw_offset_deg)
+        )
         opti_err = mocap_pose_error(
             mocap_xyz,
             mocap_yaw,
@@ -925,15 +482,54 @@ def print_pose_log_block(
             plan.desired_mocap_yaw,
             curr_minus_desired=curr_minus_desired,
         )
-        print(f"opti_current {_fmt_opti_pose(mocap_xyz, mocap_yaw)}")
-        print(
-            f"opti_target {_fmt_opti_pose(plan.desired_mocap_xyz, plan.desired_mocap_yaw)}"
+        body_yaw_err_deg = math.degrees(
+            wrap_angle(plan.desired_body_yaw_in_opti - body_yaw_cur)
+            if not curr_minus_desired
+            else wrap_angle(body_yaw_cur - plan.desired_body_yaw_in_opti)
         )
-        print(f"opti_error {_fmt_opti_error(opti_err)}")
+        print(
+            f"opti_current marker {_fmt_opti_pose(mocap_xyz, mocap_yaw)}  "
+            f"{body_yaw_label}_yaw_deg={math.degrees(body_yaw_cur):.2f}"
+        )
+        print(
+            f"opti_target  marker {_fmt_opti_pose(plan.desired_mocap_xyz, plan.desired_mocap_yaw)}  "
+            f"{body_yaw_label}_yaw_deg={math.degrees(plan.desired_body_yaw_in_opti):.2f}"
+        )
+        print(
+            f"opti_error {_fmt_opti_error(opti_err)}  "
+            f"d{body_yaw_label}_yaw_deg={body_yaw_err_deg:+.2f}"
+        )
+        est = _empirical_marker_offset_deg(plan, robot_current, mocap_xyz)
+        if est is None:
+            hb_yaw_change_deg = math.degrees(
+                wrap_angle(float(robot_current[2]) - float(plan.robot_start[2]))
+            )
+            if abs(hb_yaw_change_deg) > 2.0:
+                reason = (
+                    f"hb yaw changed {hb_yaw_change_deg:+.1f} deg "
+                    f"(pivot phase — biased, skipping)"
+                )
+            else:
+                reason = "need more straight-line motion"
+            print(
+                f"marker_offset_est_deg = ({reason})  "
+                f"using {plan.marker_yaw_offset_deg:+.2f} deg"
+            )
+        else:
+            correction = wrap_angle(
+                math.radians(est - plan.marker_yaw_offset_deg)
+            )
+            print(
+                f"marker_offset_est_deg = {est:+.2f}  "
+                f"using {plan.marker_yaw_offset_deg:+.2f}  "
+                f"(rerun with --marker-yaw-offset-deg {est:+.1f} to fix; "
+                f"residual {math.degrees(correction):+.1f} deg)"
+            )
     else:
         print("opti_current (unavailable)")
         print(
-            f"opti_target {_fmt_opti_pose(plan.desired_mocap_xyz, plan.desired_mocap_yaw)}"
+            f"opti_target  marker {_fmt_opti_pose(plan.desired_mocap_xyz, plan.desired_mocap_yaw)}  "
+            f"{body_yaw_label}_yaw_deg={math.degrees(plan.desired_body_yaw_in_opti):.2f}"
         )
         print("opti_error (unavailable)")
 
@@ -977,7 +573,7 @@ def _resolve_absolute_mocap_target(
         [float(args.target_x), float(args.target_y), float(args.target_z)],
         dtype=np.float64,
     )
-    if args.target_yaw_deg is None:
+    if args.no_target_yaw or args.target_yaw_deg is None:
         return xyz, None
     return xyz, math.radians(float(args.target_yaw_deg))
 
@@ -1038,8 +634,8 @@ def main(argv: list[str] | None = None) -> int:
             translation_only_calib=args.calib_translation_only,
             calib_yaw_deg=args.calib_yaw_deg,
             cardinal_hb=args.cardinal_hb,
-            direct_motion=not args.translate_then_rotate,
-            robot_input_rot_deg=float(args.robot_input_rot_deg),
+            direct_motion=args.direct_motion,
+            marker_yaw_offset_deg=float(args.marker_yaw_offset_deg),
             face_lab_yaw=_resolve_face_lab_yaw(args),
             robot_pose_key=args.robot_pose_key,
             mocap_pos_key=args.mocap_pos_key,
@@ -1079,7 +675,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  hb(mocap_start)  = {hb_at_mocap_start.round(4).tolist()}  residual={calib_err:.4f} m")
     if plan.absolute_target:
         yaw_note = (
-            f"yaw={math.degrees(plan.desired_mocap_yaw):.1f} deg (Motive lab)"
+            f"body_yaw={math.degrees(plan.desired_body_yaw_in_opti):.1f} deg "
+            f"(marker_yaw={math.degrees(plan.desired_mocap_yaw):.1f} deg, Motive lab)"
             if plan.require_final_yaw
             else "hold startup yaw"
         )
@@ -1095,13 +692,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"  mocap Δ (goal)   = {plan.mocap_delta_world_xy.round(4).tolist()} m  "
-        f"(Opti target; lab ±X/±Y only)"
+        f"(Opti world target − start)"
     )
     print(
-        f"  mocap Δ (hb cmd) = {plan.mocap_delta_rotated_xy.round(4).tolist()} m  "
-        f"(after robot-frame rot {plan.robot_input_rot_deg:.1f} deg)"
+        f"  marker yaw off   = {plan.marker_yaw_offset_deg:+.2f} deg  "
+        f"(marker = body + offset in Opti world; baked into calib.rot)"
     )
-    print(f"  robot-frame rot  = {plan.robot_input_rot_deg:.1f} deg on translation + yaw")
+    print(
+        f"  body yaw @ start = {math.degrees(plan.body_start_yaw_in_opti):+.2f} deg  "
+        f"(mocap yaw − offset; the angle calib.rot inverts)"
+    )
     print(f"  hb Δ (odom)      = {plan.hb_delta_xy.round(4).tolist()} m")
     dx_g, dy_g = plan.mocap_delta_world_xy[0], plan.mocap_delta_world_xy[1]
     if abs(dx_g) > 1e-6:
@@ -1125,19 +725,21 @@ def main(argv: list[str] | None = None) -> int:
     if plan.face_lab_yaw is not None:
         print(
             f"  face Motive      = {plan.face_lab_yaw}  "
-            f"(Opti heading {math.degrees(plan.desired_mocap_yaw):.1f} deg, "
-            f"hb yaw {math.degrees(plan.hb_target_yaw):.1f} deg)"
+            f"body_yaw={math.degrees(plan.desired_body_yaw_in_opti):.1f} deg  "
+            f"(marker_yaw={math.degrees(plan.desired_mocap_yaw):.1f} deg, "
+            f"hb yaw={math.degrees(plan.hb_target_yaw):.1f} deg)"
         )
     elif plan.absolute_target and plan.require_final_yaw:
         print(
-            f"  target heading   = Opti {math.degrees(plan.desired_mocap_yaw):.1f} deg  "
-            f"hb yaw {math.degrees(plan.hb_target_yaw):.1f} deg"
+            f"  target heading   = body_yaw={math.degrees(plan.desired_body_yaw_in_opti):.1f} deg  "
+            f"(marker_yaw={math.degrees(plan.desired_mocap_yaw):.1f} deg, "
+            f"hb yaw={math.degrees(plan.hb_target_yaw):.1f} deg)"
         )
     elif plan.absolute_target:
         print(
             f"  orientation      = hold startup (hb yaw {math.degrees(plan.hb_target_yaw):.1f} deg)"
         )
-    print(f"  hb1 target       = {plan.robot_target.tolist()}  ({KEYS.desired_pose})")
+    print(f"  hb1 target       = {plan.robot_target.tolist()}  ({BASE_KEYS.desired_pose})")
     print(f"  hb waypoints     = {len(plan.hb_waypoints)} step(s)")
     print(
         f"  mocap keys       = {args.mocap_pos_key} / {args.mocap_ori_key} / "
@@ -1147,10 +749,19 @@ def main(argv: list[str] | None = None) -> int:
         f"  success          = |hb1_current_xy - hb1_target_xy| < "
         f"{tolerance_m:.4f} m ({args.tolerance_in:.1f} in)"
     )
+    replan_enabled = not args.no_replan
+    print(
+        "  replan           = "
+        + (
+            "per-loop from live Opti (hb_goal nudged each cycle to close opti error)"
+            if replan_enabled
+            else "fixed (hb waypoints frozen at startup)"
+        )
+    )
     if args.monitor:
         print("Monitor mode — not commanding base.")
     else:
-        print(f"Commanding {KEYS.desired_pose} at {CONTROL_HZ:.0f} Hz")
+        print(f"Commanding {BASE_KEYS.desired_pose} at {CONTROL_HZ:.0f} Hz")
 
     period = 1.0 / CONTROL_HZ
     log_period = 1.0 / max(args.log_hz, 0.1)
@@ -1161,11 +772,32 @@ def main(argv: list[str] | None = None) -> int:
     mocap_xyz: np.ndarray | None = None
     mocap_quat: np.ndarray | None = None
 
-    def active_hb_goal() -> np.ndarray:
-        return plan.hb_waypoints[min(waypoint_idx, len(plan.hb_waypoints) - 1)]
+    def fixed_hb_goal(idx: int) -> np.ndarray:
+        return plan.hb_waypoints[min(idx, len(plan.hb_waypoints) - 1)]
+
+    def compute_hb_goal(
+        idx: int,
+        robot_current: np.ndarray,
+        mocap_xyz: np.ndarray | None,
+        mocap_quat: np.ndarray | None,
+    ) -> tuple[np.ndarray, bool]:
+        """Return (hb_goal, used_opti). When replan is on and live opti is
+        available, recompute from live Opti; otherwise use the fixed waypoint."""
+        if (
+            replan_enabled
+            and mocap_xyz is not None
+            and mocap_quat is not None
+        ):
+            return (
+                replan_hb_goal_from_opti(
+                    plan, idx, mocap_xyz, mocap_quat, robot_current
+                ),
+                True,
+            )
+        return fixed_hb_goal(idx), False
 
     if not args.monitor:
-        write_desired_pose(client, active_hb_goal())
+        write_desired_pose(client, fixed_hb_goal(0))
 
     try:
         while True:
@@ -1180,25 +812,41 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
             robot_current = read_robot_se2(client, args.robot_pose_key)
-            hb_goal = active_hb_goal()
-            if waypoint_idx < len(plan.hb_waypoints) - 1:
-                if waypoint_reached(
-                    robot_current,
-                    hb_goal,
-                    waypoint_idx,
-                    plan.hb_waypoints,
-                    tolerance_m=tolerance_m,
-                    tolerance_yaw_rad=tolerance_yaw_rad,
-                ):
-                    waypoint_idx += 1
-                    hb_goal = active_hb_goal()
-                    print(f"Waypoint {waypoint_idx}: {hb_goal.round(4).tolist()}")
             try:
                 mocap_xyz, mocap_quat = read_mocap_pose(
                     client, args.mocap_pos_key, args.mocap_ori_key
                 )
             except RuntimeError:
                 mocap_xyz, mocap_quat = None, None
+
+            hb_goal, used_opti = compute_hb_goal(
+                waypoint_idx, robot_current, mocap_xyz, mocap_quat
+            )
+
+            # Waypoint advancement: prefer opti-world distance when available
+            # (the hb target keeps shifting under replan, so the hb-frame check
+            # against a fixed waypoint isn't meaningful).
+            if waypoint_idx < len(plan.hb_waypoints) - 1:
+                if used_opti and mocap_xyz is not None:
+                    xy_done = opti_xy_distance_m(plan, mocap_xyz) < tolerance_m
+                else:
+                    xy_done = waypoint_reached(
+                        robot_current,
+                        fixed_hb_goal(waypoint_idx),
+                        waypoint_idx,
+                        plan.hb_waypoints,
+                        tolerance_m=tolerance_m,
+                        tolerance_yaw_rad=tolerance_yaw_rad,
+                    )
+                if xy_done:
+                    waypoint_idx += 1
+                    hb_goal, used_opti = compute_hb_goal(
+                        waypoint_idx, robot_current, mocap_xyz, mocap_quat
+                    )
+                    print(
+                        f"Waypoint {waypoint_idx}: hb={hb_goal.round(4).tolist()}"
+                        + ("  (live opti)" if used_opti else "  (fixed)")
+                    )
 
             if robot_prev is not None:
                 jump = float(np.linalg.norm(robot_current[:2] - robot_prev[:2]))
@@ -1213,12 +861,22 @@ def main(argv: list[str] | None = None) -> int:
 
             now = time.perf_counter()
             if now - last_log >= log_period:
-                track_xy_norm = float(
-                    np.linalg.norm(robot_current[:2] - plan.robot_target[:2])
-                )
-                track_yaw_err = abs(
-                    wrap_angle(robot_current[2] - plan.robot_target[2])
-                )
+                if used_opti and mocap_xyz is not None and mocap_quat is not None:
+                    track_xy_norm = opti_xy_distance_m(plan, mocap_xyz)
+                    track_yaw_err = (
+                        opti_body_yaw_error_rad(plan, mocap_quat)
+                        if plan.require_final_yaw
+                        else 0.0
+                    )
+                    success_frame = "Opti"
+                else:
+                    track_xy_norm = float(
+                        np.linalg.norm(robot_current[:2] - plan.robot_target[:2])
+                    )
+                    track_yaw_err = abs(
+                        wrap_angle(robot_current[2] - plan.robot_target[2])
+                    )
+                    success_frame = "hb"
                 print_pose_log_block(
                     plan=plan,
                     robot_current=robot_current,
@@ -1229,26 +887,34 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print()
                 last_log = now
-                pose_ok = track_xy_norm < tolerance_m and (
-                    not plan.require_final_yaw
-                    or track_yaw_err < tolerance_yaw_rad
+                is_final = waypoint_idx >= len(plan.hb_waypoints) - 1
+                pose_ok = (
+                    is_final
+                    and track_xy_norm < tolerance_m
+                    and (
+                        not plan.require_final_yaw
+                        or track_yaw_err < tolerance_yaw_rad
+                    )
                 )
                 if pose_ok:
                     if not reached_target:
                         msg = (
-                            f"Success: hb1 within {tolerance_m:.4f} m "
-                            f"({args.tolerance_in:.1f} in) of target XY"
+                            f"Success ({success_frame}): xy within "
+                            f"{tolerance_m:.4f} m ({args.tolerance_in:.1f} in)"
                         )
                         if plan.require_final_yaw:
                             if plan.face_lab_yaw is not None:
                                 msg += (
-                                    f" and yaw within {math.degrees(tolerance_yaw_rad):.1f} deg "
+                                    f" and body yaw within "
+                                    f"{math.degrees(tolerance_yaw_rad):.1f} deg "
                                     f"(facing Motive {plan.face_lab_yaw})"
                                 )
                             else:
                                 msg += (
-                                    f" and yaw within {math.degrees(tolerance_yaw_rad):.1f} deg "
-                                    f"(Opti heading {math.degrees(plan.desired_mocap_yaw):.1f} deg)"
+                                    f" and body yaw within "
+                                    f"{math.degrees(tolerance_yaw_rad):.1f} deg "
+                                    f"(body target "
+                                    f"{math.degrees(plan.desired_body_yaw_in_opti):.1f} deg)"
                                 )
                         print(msg + " — holding.")
                         reached_target = True
@@ -1257,8 +923,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\nStopped.")
     finally:
         if args.stop_on_exit:
-            client.set(KEYS.stop, "stop")
-            print(f"Set {KEYS.stop!r} = 'stop'")
+            stop_base(client)
+            print(f"Set {BASE_KEYS.stop!r} = 'stop'")
 
     return 0
 
