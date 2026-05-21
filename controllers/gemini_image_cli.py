@@ -22,7 +22,7 @@ _PYTHON_CONTROL = Path(__file__).resolve().parent
 if str(_PYTHON_CONTROL) not in sys.path:
     sys.path.insert(0, str(_PYTHON_CONTROL))
 
-from vision import gemini_pointing as gp  # noqa: E402
+from ZitiBot.controllers.vision import gemini_pointing_old as gp  # noqa: E402
 
 
 def main() -> int:

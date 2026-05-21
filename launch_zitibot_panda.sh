@@ -1,44 +1,41 @@
 #!/usr/bin/env bash
 # Start OpenSai (zitibot_panda.xml) via scripts/launch.sh, then a ZitiBot Python controller.
 #
-# Controllers live under ZitiBot/controllers/ (base / opti not included here).
+# Pass the controller as a file path (relative to ZitiBot/, relative to cwd, or absolute).
 #
 # Usage:
-#   ./launch_zitibot_panda.sh touch
-#   ./launch_zitibot_panda.sh vision
-#   ./launch_zitibot_panda.sh vision -- --object mug
-#   ./launch_zitibot_panda.sh --wait touch
+#   ./launch_zitibot_panda.sh controllers/touch_controller.py
+#   ./launch_zitibot_panda.sh controllers/vision_controller.py
+#   ./launch_zitibot_panda.sh controllers/vision_controller_new.py
+#   ./launch_zitibot_panda.sh controllers/vision_controller.py -- --object mug
+#   ./launch_zitibot_panda.sh controllers/vision_controller_new.py -- --no-goal-offset
+#   ./launch_zitibot_panda.sh controllers/vision_controller_new.py -- --goal-offset-x 0.053 --goal-offset-z -0.10
+#   ./launch_zitibot_panda.sh --wait controllers/touch_controller.py
 #
 # Prerequisites: OpenSai built (bin/OpenSai_main), Redis reachable.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CONTROLLERS_DIR="${SCRIPT_DIR}/controllers"
 CONFIG_XML="config_folder/xml_config_files/zitibot_panda.xml"
 LAUNCH_SH="${REPO_ROOT}/scripts/launch.sh"
 OPENSAI_MAIN="${REPO_ROOT}/bin/OpenSai_main"
 PYTHON="${PYTHON:-python3}"
 
 WAIT_FOR_SPACE=false
-CONTROLLER_NAME=""
+CONTROLLER_ARG=""
 CONTROLLER_ARGS=()
 
-declare -A CONTROLLER_SCRIPTS=(
-	[touch]="touch_controller.py"
-	[vision]="vision_controller.py"
-)
-
 usage() {
-	echo "Usage: $(basename "$0") [--wait] <controller> [-- controller.py args...]"
+	echo "Usage: $(basename "$0") [--wait] <controller.py> [-- controller.py args...]"
 	echo ""
 	echo "Starts: scripts/launch.sh ${CONFIG_XML}"
-	echo "Then runs a Python controller from ZitiBot/controllers/."
+	echo "Then runs the given Python controller file."
 	echo ""
-	echo "Controllers:"
-	for name in "${!CONTROLLER_SCRIPTS[@]}"; do
-		echo "  ${name}  ->  ${CONTROLLER_SCRIPTS[${name}]}"
-	done | sort
+	echo "Controller path resolution (first match wins):"
+	echo "  1. exact path as given (absolute or relative to cwd)"
+	echo "  2. relative to ZitiBot/ (so 'controllers/foo.py' works)"
+	echo "  3. relative to ZitiBot/controllers/ (so 'foo.py' works)"
 	echo ""
 	echo "Options:"
 	echo "  --wait    press SPACE in this terminal before starting the controller"
@@ -56,8 +53,8 @@ while [[ $# -gt 0 ]]; do
 			exit 1
 			;;
 		*)
-			if [[ -z "${CONTROLLER_NAME}" ]]; then
-				CONTROLLER_NAME="$1"
+			if [[ -z "${CONTROLLER_ARG}" ]]; then
+				CONTROLLER_ARG="$1"
 				shift
 			else
 				CONTROLLER_ARGS+=("$1")
@@ -67,24 +64,38 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-if [[ -z "${CONTROLLER_NAME}" ]]; then
-	echo "Error: controller name required (e.g. touch, vision)." >&2
+if [[ -z "${CONTROLLER_ARG}" ]]; then
+	echo "Error: controller file path required (e.g. controllers/vision_controller.py)." >&2
 	echo "Run: $(basename "$0") --help" >&2
 	exit 1
 fi
 
-CONTROLLER_SCRIPT="${CONTROLLER_SCRIPTS[${CONTROLLER_NAME}]-}"
-if [[ -z "${CONTROLLER_SCRIPT}" ]]; then
-	echo "Error: unknown controller '${CONTROLLER_NAME}'." >&2
-	echo "Available: ${!CONTROLLER_SCRIPTS[*]}" >&2
+resolve_controller_path() {
+	local arg="$1"
+	local candidates=(
+		"${arg}"
+		"${SCRIPT_DIR}/${arg}"
+		"${SCRIPT_DIR}/controllers/${arg}"
+	)
+	for c in "${candidates[@]}"; do
+		if [[ -f "${c}" ]]; then
+			(cd "$(dirname "${c}")" && printf '%s/%s\n' "$(pwd)" "$(basename "${c}")")
+			return 0
+		fi
+	done
+	return 1
+}
+
+if ! CONTROLLER_PATH="$(resolve_controller_path "${CONTROLLER_ARG}")"; then
+	echo "Error: controller file not found: ${CONTROLLER_ARG}" >&2
+	echo "Looked in: cwd, ${SCRIPT_DIR}/, ${SCRIPT_DIR}/controllers/" >&2
 	exit 1
 fi
 
-CONTROLLER_PATH="${CONTROLLERS_DIR}/${CONTROLLER_SCRIPT}"
-if [[ ! -f "${CONTROLLER_PATH}" ]]; then
-	echo "Missing ${CONTROLLER_PATH}" >&2
-	exit 1
-fi
+CONTROLLER_DIR="$(dirname "${CONTROLLER_PATH}")"
+CONTROLLER_SCRIPT="$(basename "${CONTROLLER_PATH}")"
+CONTROLLER_NAME="${CONTROLLER_SCRIPT%.py}"
+
 if [[ ! -f "${LAUNCH_SH}" ]]; then
 	echo "Missing ${LAUNCH_SH}" >&2
 	exit 1
@@ -171,6 +182,7 @@ wait_for_opensai_config() {
 }
 
 echo "=== launch_zitibot_panda ==="
+echo "Controller: ${CONTROLLER_PATH}"
 echo "1) Starting OpenSai: scripts/launch.sh ${CONFIG_XML}"
 (
 	cd "${REPO_ROOT}"
@@ -203,25 +215,20 @@ else
 fi
 
 echo "2) Starting ${CONTROLLER_NAME}: ${PYTHON} ${CONTROLLER_PATH} ${CONTROLLER_ARGS[*]-}"
+echo "   (Ctrl+C to stop the controller and OpenSai.)"
+
+# Run the controller in the FOREGROUND so it inherits this terminal's stdin.
+# Backgrounding it (with &) makes Python's readline() see EOF immediately on
+# many systems, which causes interactive controllers to misbehave.
+CTRL_EXIT=0
 (
-	cd "${CONTROLLERS_DIR}"
+	cd "${CONTROLLER_DIR}"
 	exec "${PYTHON}" "${CONTROLLER_SCRIPT}" "${CONTROLLER_ARGS[@]}"
-) &
-CTRL_PID=$!
+) || CTRL_EXIT=$?
 
-# Exit when either launch.sh or the controller stops.
-while kill -0 "${LAUNCH_PID}" 2>/dev/null && kill -0 "${CTRL_PID}" 2>/dev/null; do
-	if IFS= read -r -n1 -t 1 key; then
-		if [[ "${key}" == "q" || "${key}" == "Q" ]]; then
-			echo "Quit key pressed; shutting down." >&2
-			break
-		fi
-	fi
-done
-
-if ! kill -0 "${LAUNCH_PID}" 2>/dev/null && kill -0 "${CTRL_PID}" 2>/dev/null; then
-	echo "OpenSai exited; stopping controller." >&2
+if [[ ${CTRL_EXIT} -ne 0 ]]; then
+	echo "Controller exited with code ${CTRL_EXIT}." >&2
+else
+	echo "Controller exited." >&2
 fi
-if ! kill -0 "${CTRL_PID}" 2>/dev/null && kill -0 "${LAUNCH_PID}" 2>/dev/null; then
-	echo "Controller exited; stopping OpenSai." >&2
-fi
+echo "Stopping OpenSai." >&2

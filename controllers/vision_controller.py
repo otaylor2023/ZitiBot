@@ -41,7 +41,7 @@ if str(_PYTHON_CONTROL) not in sys.path:
     sys.path.insert(0, str(_PYTHON_CONTROL))
 
 import redis
-from vision import gemini_pointing as gp
+from vision import gemini_pointing_old as gp
 from vision import realsense_rgbd as rs_cam
 
 CONFIG_XML = os.environ.get("ZITIBOT_OPENSAI_CONFIG_XML", "zitibot_panda.xml")
