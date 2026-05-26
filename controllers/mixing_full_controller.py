@@ -233,6 +233,77 @@ def _gripper_converged(redis_client, target_w: float, tol: float) -> bool:
     return w is not None and abs(w - target_w) < tol
 
 
+# ── Calibration helpers ────────────────────────────────────────────────────────
+def _read_optitrack(redis_client) -> str:
+    lines = []
+    for key, label in (("tidybot01::pos", "optitrack pos"),
+                       ("tidybot01::ori", "optitrack ori")):
+        raw = redis_client.get(key)
+        if raw is not None:
+            try:
+                lines.append(f"    {label:14s}: {json.loads(raw)}")
+            except Exception:
+                pass
+    return "\n".join(lines) if lines else "    (OptiTrack keys not found in Redis)"
+
+
+def _log_calib_snapshot(redis_client, label: str,
+                        calib_log: dict,
+                        ee_pos: np.ndarray | None,
+                        base: np.ndarray | None = None) -> None:
+    """Print and record the current EE position, base pose, and OptiTrack at a key moment."""
+    print(f"  [calib:{label}]")
+    if ee_pos is not None:
+        vec = [round(float(v), 4) for v in ee_pos]
+        print(f"    EE world pos   : {vec}")
+        calib_log[f"{label}_ee"] = vec
+    if base is not None:
+        bvec = [round(float(v), 4) for v in base]
+        print(f"    base pose      : {bvec}  (x, y, yaw_rad)")
+        calib_log[f"{label}_base"] = bvec
+    print(_read_optitrack(redis_client))
+
+
+def _print_calib_summary_full(
+    calib_log: dict,
+    ladle_pos: np.ndarray,
+    bowl_pos: np.ndarray,
+    z_mix_ee: float,
+    z_above_bowl: float,
+    base_ladle_goal: np.ndarray,
+    base_bowl_goal: np.ndarray,
+) -> None:
+    """Print a calibration box with every value needed to run without --relative."""
+    def fv(v) -> str:
+        return " ".join(f"{x:.4f}" for x in v)
+
+    W = 62  # inner width
+    def row(label: str, val: str) -> str:
+        content = f"  {label:<22s}{val}"
+        return f"║{content:<{W}}║"
+
+    sep   = f"╠{'═' * W}╣"
+    top   = f"╔{'═' * W}╗"
+    bot   = f"╚{'═' * W}╝"
+    title = f"║{'CALIBRATION SUMMARY — mixing_full_controller':^{W}}║"
+
+    lines = [top, title, sep]
+    lines.append(row("--ladle-xyz",    fv(ladle_pos)))
+    lines.append(row("--bowl-xyz",     fv(bowl_pos)))
+    lines.append(row("--z-mix-ee",     f"{z_mix_ee:.4f}"))
+    lines.append(row("--z-above-bowl", f"{z_above_bowl:.4f}"))
+    lines.append(row("--base-ladle",   fv(base_ladle_goal)))
+    lines.append(row("--base-bowl",    fv(base_bowl_goal)))
+
+    if calib_log:
+        lines.append(sep)
+        for label, val in calib_log.items():
+            lines.append(row(label, fv(val) if isinstance(val, (list, np.ndarray)) else str(val)))
+
+    lines.append(bot)
+    print("\n" + "\n".join(lines) + "\n")
+
+
 # ── FSM ───────────────────────────────────────────────────────────────────────
 class _State(enum.Enum):
     MOVE_BASE_GRASP    = "MOVE_BASE_GRASP"
@@ -409,6 +480,20 @@ def _run_fsm(redis_client, args,
     base_ladle_goal = np.array(args.base_ladle, dtype=np.float64)
     base_bowl_goal  = np.array(args.base_bowl,  dtype=np.float64)
 
+    # ── Relative-base mode: resolve base offsets to absolute odometry coords ──
+    if args.relative_base:
+        base_now = _read_base_pose(redis_client)
+        if base_now is None:
+            print("--relative-base: hb1::current_pose not in Redis. Aborting.")
+            return 1
+        print(f"\n[relative-base mode] base origin: {base_now.tolist()}")
+        base_ladle_goal = base_now + base_ladle_goal
+        base_ladle_goal[2] = _wrap_angle(base_ladle_goal[2])
+        base_bowl_goal  = base_now + base_bowl_goal
+        base_bowl_goal[2] = _wrap_angle(base_bowl_goal[2])
+        print(f"  --base-ladle resolved → {base_ladle_goal.tolist()}")
+        print(f"  --base-bowl  resolved → {base_bowl_goal.tolist()}")
+
     R_grasp = _link7_orientation_world(0.0, 0.0, 45.0)
     R_mix   = _ladle_mixing_orientation()
 
@@ -462,6 +547,8 @@ def _run_fsm(redis_client, args,
     hold_ee_pos: np.ndarray | None = None
     hold_ee_ori: np.ndarray | None = None
 
+    calib_log: dict[str, list[float]] = {}
+
     try:
         while state != _State.DONE:
             now  = time.perf_counter()
@@ -492,6 +579,7 @@ def _run_fsm(redis_client, args,
                     _set_gripper(redis_client, open_w, spd, frc)
                     print(f"  hover target: {hover_w.tolist()}")
                     print(f"  EE now      : {cur_pos.tolist() if cur_pos is not None else 'unknown'}")
+                    _log_calib_snapshot(redis_client, "near_ladle", calib_log, cur_pos, base)
 
                 elif state == _State.EE_GRASP_LADLE:
                     grasp_phase = 0
@@ -514,6 +602,7 @@ def _run_fsm(redis_client, args,
 
                 elif state == _State.EE_ABOVE_BOWL:
                     print(f"  bowl above  : {above_bowl_pos.tolist()}")
+                    _log_calib_snapshot(redis_client, "near_bowl", calib_log, cur_pos, base)
 
                 elif state == _State.EE_LOWER_INTO_BOWL:
                     print(f"  mix height  : {at_bowl_pos.tolist()}")
@@ -522,6 +611,7 @@ def _run_fsm(redis_client, args,
                     mix_t0 = last_mix_print = now
                     print(f"  Stirring for {args.mix_dur:.1f} s  "
                           f"(r={args.mix_radius} m, ω={args.mix_omega} rad/s)")
+                    _log_calib_snapshot(redis_client, "mix_height", calib_log, cur_pos, base)
 
                 elif state == _State.EE_LIFT_FROM_BOWL:
                     print(f"  lift to     : {above_bowl_pos.tolist()}")
@@ -537,6 +627,7 @@ def _run_fsm(redis_client, args,
                     orient_t0   = now
                     print(f"  3-phase sub-FSM: hover+SLERP → descend → open")
                     print(f"  hover target: {hover_w.tolist()}")
+                    _log_calib_snapshot(redis_client, "return_ladle", calib_log, cur_pos, base)
 
                 prev_state = state
 
@@ -704,9 +795,19 @@ def _run_fsm(redis_client, args,
 
     except KeyboardInterrupt:
         print("\nInterrupted — holding last goal.")
+        _print_calib_summary_full(
+            calib_log, ladle_pos, bowl_pos,
+            z_mix_ee, z_above_bowl,
+            base_ladle_goal, base_bowl_goal,
+        )
         return 0
 
     print("\n>>> DONE — ladle released, task complete.")
+    _print_calib_summary_full(
+        calib_log, ladle_pos, bowl_pos,
+        z_mix_ee, z_above_bowl,
+        base_ladle_goal, base_bowl_goal,
+    )
     return 0
 
 
@@ -795,6 +896,23 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--redis-host", default="localhost")
     p.add_argument("--redis-port", type=int, default=6379)
 
+    p.add_argument(
+        "--relative", action="store_true",
+        help=(
+            "Interpret --ladle-xyz and --bowl-xyz as offsets from the arm's current "
+            "EE position at startup. Use (0 0 0) to reference the ladle from wherever "
+            "the arm currently is. Logs absolute coords at each key state for hardcoding."
+        ),
+    )
+    p.add_argument(
+        "--relative-base", action="store_true",
+        help=(
+            "Interpret --base-ladle and --base-bowl as offsets from the current "
+            "hb1 odometry pose at startup (dx, dy, dyaw). Combine with --relative to "
+            "test the full pipeline without knowing any absolute coordinates."
+        ),
+    )
+
     return p.parse_args()
 
 
@@ -821,6 +939,22 @@ def main() -> int:
                  if args.ladle_xyz is not None else None)
     bowl_xyz  = (np.array(args.bowl_xyz,  dtype=np.float64)
                  if args.bowl_xyz  is not None else None)
+
+    # ── Relative mode: resolve EE offsets to absolute world coordinates ────────
+    if args.relative and (ladle_xyz is not None or bowl_xyz is not None):
+        pose = vc.read_current_ee_world(redis_client)
+        if pose is None:
+            print("--relative: cannot read current EE pose from Redis. Aborting.",
+                  file=sys.stderr)
+            return 1
+        ee_origin = pose[0]
+        print(f"\n[relative mode] EE origin at startup: {ee_origin.tolist()}")
+        if ladle_xyz is not None:
+            ladle_xyz = ee_origin + ladle_xyz
+            print(f"  --ladle-xyz resolved → {ladle_xyz.tolist()}")
+        if bowl_xyz is not None:
+            bowl_xyz = ee_origin + bowl_xyz
+            print(f"  --bowl-xyz  resolved → {bowl_xyz.tolist()}")
 
     need_ladle = ladle_xyz is None
     need_bowl  = bowl_xyz  is None

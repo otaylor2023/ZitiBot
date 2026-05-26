@@ -158,6 +158,31 @@ def _gripper_open_width(redis_client, override: float | None) -> float:
     return 0.08
 
 
+def _read_optitrack(redis_client) -> str:
+    """Read OptiTrack base position/orientation if available; return a display string."""
+    lines = []
+    for key, label in (("tidybot01::pos", "optitrack pos"),
+                       ("tidybot01::ori", "optitrack ori")):
+        raw = redis_client.get(key)
+        if raw is not None:
+            try:
+                lines.append(f"    {label:14s}: {json.loads(raw)}")
+            except Exception:
+                pass
+    return "\n".join(lines) if lines else "    (OptiTrack keys not found in Redis)"
+
+
+def _log_calib_snapshot(redis_client, label: str,
+                        calib_log: dict, ee_pos: np.ndarray | None) -> None:
+    """Print and record the current EE position + OptiTrack at a key moment."""
+    print(f"  [calib:{label}]")
+    if ee_pos is not None:
+        vec = [round(float(v), 4) for v in ee_pos]
+        print(f"    EE world pos   : {vec}")
+        calib_log[label] = vec
+    print(_read_optitrack(redis_client))
+
+
 # ── FSM ───────────────────────────────────────────────────────────────────────
 class _State(enum.Enum):
     MOVE_TO_WAIT    = "MOVE_TO_WAIT"      # move arm to receive position, gripper open
@@ -221,7 +246,41 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--redis-port", type=int, default=6379)
     p.add_argument("--loop-hz",    type=int, default=_LOOP_HZ_DEFAULT,
                    help=f"Control loop rate (Hz). Default: {_LOOP_HZ_DEFAULT}")
+    p.add_argument(
+        "--relative", action="store_true",
+        help=(
+            "Interpret --wait-xyz and --bowl-xyz as offsets from the arm's current "
+            "EE position at startup rather than absolute world-frame coordinates. "
+            "Use (0 0 0) for wait-xyz to stay exactly where the arm is. "
+            "At each key state arrival the controller prints the absolute EE position "
+            "and OptiTrack pose so you can hardcode them for the next run."
+        ),
+    )
     return p.parse_args()
+
+
+# ── Calibration summary ───────────────────────────────────────────────────────
+def _print_calib_summary_simple(calib_log: dict, args) -> None:
+    """Print a ready-to-paste command with hardcoded absolute positions."""
+    wp  = calib_log.get("wait_pos")
+    ab  = calib_log.get("above_bowl")
+    mix = calib_log.get("mix_height")
+
+    print("\n╔══════════════════════════════════════════════════════════╗")
+    print("║  Calibration summary — paste these args for absolute mode ║")
+    print("╠══════════════════════════════════════════════════════════╣")
+    if wp:
+        print(f"  --wait-xyz  {wp[0]:.4f} {wp[1]:.4f} {wp[2]:.4f}")
+    if ab:
+        # bowl centre X/Y from above_bowl; Z from mix_height if available
+        bz = mix[2] - 0.283 if mix else ab[2] - args.z_above  # invert z_mix_ee formula
+        print(f"  --bowl-xyz  {ab[0]:.4f} {ab[1]:.4f} {bz:.4f}  "
+              f"(bowl centre; z estimated from mix height)")
+    if mix:
+        print(f"  --z-mix-ee  {mix[2]:.4f}  (override auto-computed value)")
+    if not (wp or ab or mix):
+        print("  (no positions logged — run completed too early)")
+    print("╚══════════════════════════════════════════════════════════╝\n")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -235,9 +294,27 @@ def main() -> int:
     if err is not None:
         return err
 
+    # ── Resolve positions (absolute or relative) ──────────────────────────────
+    if args.relative:
+        init_pose = vc.read_current_ee_world(redis_client)
+        if init_pose is None:
+            print("--relative: cannot read current EE position from Redis. "
+                  "Is the arm controller running?", file=sys.stderr)
+            return 1
+        ee_origin = init_pose[0]
+        wait_pos = ee_origin + np.array(args.wait_xyz, dtype=np.float64)
+        bowl_xyz = ee_origin + np.array(args.bowl_xyz, dtype=np.float64)
+        print(f"  [relative mode]  EE origin : {ee_origin.round(4).tolist()}")
+        print(f"  [relative mode]  wait_pos  : {wait_pos.round(4).tolist()} "
+              f" (offset {args.wait_xyz})")
+        print(f"  [relative mode]  bowl_xyz  : {bowl_xyz.round(4).tolist()} "
+              f" (offset {args.bowl_xyz})")
+        print(_read_optitrack(redis_client))
+    else:
+        wait_pos = np.array(args.wait_xyz, dtype=np.float64)
+        bowl_xyz = np.array(args.bowl_xyz, dtype=np.float64)
+
     # Geometry
-    wait_pos = np.array(args.wait_xyz, dtype=np.float64)
-    bowl_xyz = np.array(args.bowl_xyz, dtype=np.float64)
     bowl_cx, bowl_cy, bowl_cz = bowl_xyz
     z_above_bowl = bowl_cz + args.z_above
     # z_mix_ee: EE height inside bowl. With ladle vertical, EE control point is
@@ -269,6 +346,7 @@ def main() -> int:
     state      = _State.MOVE_TO_WAIT
     prev_state = None
     dt         = 1.0 / max(1, args.loop_hz)
+    calib_log: dict[str, list[float]] = {}   # filled during run; printed in summary
 
     wait_t0 = grab_t0 = orient_t0 = mix_t0 = gripper_cmd_t0 = 0.0
     last_mix_print = last_countdown = 0.0
@@ -290,6 +368,8 @@ def main() -> int:
                     print(f"  EE now   : {cur_pos.tolist() if cur_pos is not None else 'unknown'}")
 
                 elif state == _State.WAIT_RECEIVE:
+                    # Arm just converged to wait_pos — log absolute position.
+                    _log_calib_snapshot(redis_client, "wait_pos", calib_log, cur_pos)
                     print(f"  Gripper open ({open_w:.4f} m). Insert tool in the next "
                           f"{args.receive_wait:.0f} s.")
                     wait_t0 = last_countdown = now
@@ -309,9 +389,13 @@ def main() -> int:
                     print(f"  EE goal  : {above_bowl_pos.tolist()}")
 
                 elif state == _State.LOWER_INTO_BOWL:
+                    # Arm just converged above the bowl — log bowl XY + above-bowl Z.
+                    _log_calib_snapshot(redis_client, "above_bowl", calib_log, cur_pos)
                     print(f"  EE goal  : {at_bowl_pos.tolist()}")
 
                 elif state == _State.MIX:
+                    # Arm just reached mixing height — log z_mix_ee.
+                    _log_calib_snapshot(redis_client, "mix_height", calib_log, cur_pos)
                     mix_t0 = last_mix_print = now
                     print(f"  Stirring for {args.mix_dur:.1f} s  "
                           f"(r={args.mix_radius} m, ω={args.mix_omega} rad/s)")
@@ -441,6 +525,7 @@ def main() -> int:
         return 0
 
     print("\n>>> DONE — gripper released, task complete.")
+    _print_calib_summary_simple(calib_log, args)
     return 0
 
 
