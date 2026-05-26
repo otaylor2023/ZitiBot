@@ -41,8 +41,11 @@ import argparse
 import enum
 import json
 import math
+import select
 import sys
+import termios
 import time
+import tty
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -304,6 +307,62 @@ def _print_calib_summary_full(
     print("\n" + "\n".join(lines) + "\n")
 
 
+# ── Interactive keypress helpers ──────────────────────────────────────────────
+def _setup_cbreak() -> list | None:
+    try:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        return old
+    except Exception:
+        return None
+
+
+def _restore_stdin(old_attrs) -> None:
+    if old_attrs is not None:
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_attrs)
+        except Exception:
+            pass
+
+
+def _check_keypress() -> str | None:
+    try:
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+    except Exception:
+        pass
+    return None
+
+
+def _print_ee_status(redis_client, state_name: str,
+                     cur_pos: np.ndarray | None,
+                     base: np.ndarray | None = None) -> None:
+    """Print current vs desired EE position and base pose."""
+    raw_goal = redis_client.get(_KEYS.cartesian_task_goal_position)
+    goal_pos = None
+    if raw_goal is not None:
+        try:
+            goal_pos = json.loads(raw_goal)
+        except Exception:
+            pass
+
+    print(f"\n  [EE status | state={state_name}]")
+    if goal_pos is not None:
+        print(f"    desired EE : {[round(v, 4) for v in goal_pos]}")
+    else:
+        print("    desired EE : (not published yet)")
+    if cur_pos is not None:
+        print(f"    current EE : {[round(float(v), 4) for v in cur_pos]}")
+        if goal_pos is not None:
+            err = np.linalg.norm(cur_pos - np.array(goal_pos))
+            print(f"    EE error   : {err:.4f} m")
+    else:
+        print("    current EE : (Redis EE pose unavailable)")
+    if base is not None:
+        print(f"    base pose  : {[round(float(v), 4) for v in base]}  (x, y, yaw_rad)")
+
+
 # ── FSM ───────────────────────────────────────────────────────────────────────
 class _State(enum.Enum):
     MOVE_BASE_GRASP    = "MOVE_BASE_GRASP"
@@ -549,6 +608,9 @@ def _run_fsm(redis_client, args,
 
     calib_log: dict[str, list[float]] = {}
 
+    _stdin_attrs = _setup_cbreak()
+    print("  [press 'p' at any time to print current vs desired EE position]")
+
     try:
         while state != _State.DONE:
             now  = time.perf_counter()
@@ -793,7 +855,12 @@ def _run_fsm(redis_client, args,
 
             time.sleep(dt)
 
+            key = _check_keypress()
+            if key == "p":
+                _print_ee_status(redis_client, state.value, cur_pos, base)
+
     except KeyboardInterrupt:
+        _restore_stdin(_stdin_attrs)
         print("\nInterrupted — holding last goal.")
         _print_calib_summary_full(
             calib_log, ladle_pos, bowl_pos,
@@ -802,6 +869,7 @@ def _run_fsm(redis_client, args,
         )
         return 0
 
+    _restore_stdin(_stdin_attrs)
     print("\n>>> DONE — ladle released, task complete.")
     _print_calib_summary_full(
         calib_log, ladle_pos, bowl_pos,
