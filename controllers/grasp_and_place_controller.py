@@ -2,8 +2,8 @@
 """Fixed-pose grasp + transport + place on OpenSai Franka (Redis only).
 
 Pick and place positions are configurable (world frame, meters). End-effector
-orientation stays **fixed** for the whole sequence (tool Z down, 45° yaw). Only
-position changes between pick, lift, transit, and place.
+orientation stays **fixed** for the whole sequence (tool Z down, 45° yaw). Pick
+and place use **Z-only** descents (XY held at the target).
 
 Every state transition is **manually gated by ENTER**.
 
@@ -12,11 +12,11 @@ Startup (no ENTER): move **above** the pick pose (``+lift-dz`` in world Z) with 
 
 Then one ENTER per step:
 
-- ENTER (1) — descend to pick pose.
+- ENTER (1) — descend in Z to pick pose.
 - ENTER (2) — close gripper.
 - ENTER (3) — lift +Z by ``--lift-dz``.
 - ENTER (4) — move above place pose (same orientation).
-- ENTER (5) — descend to place pose (same orientation).
+- ENTER (5) — descend in Z to place pose (same level as ``--place``).
 - ENTER (6) — open gripper.
 - ``q`` / Ctrl+C — quit.
 
@@ -37,7 +37,6 @@ import argparse
 import enum
 import json
 import os
-import select
 import sys
 import time
 from dataclasses import dataclass
@@ -86,8 +85,9 @@ _KEYS = _RedisKeys()
 
 _GRASP_YAW_RAD = np.radians(45.0)
 _c, _s = np.cos(_GRASP_YAW_RAD), np.sin(_GRASP_YAW_RAD)
-DEFAULT_PICK_POSITION = np.array([0.4, -0.2, 0.35])
-DEFAULT_PLACE_POSITION = np.array([0.55, 0.15, 0.35])
+# World-frame default grasp/place coordinates (meters).
+DEFAULT_PICK_POSITION = np.array([0.364646, 0.019878, 0.353623])
+DEFAULT_PLACE_POSITION = np.array([0.775011, -0.0787334, 0.331972])
 EE_ORIENTATION = np.array(
     [
         [_c, -_s, 0.0],
@@ -99,7 +99,8 @@ EE_ORIENTATION = np.array(
 DEFAULT_LIFT_DZ_M = 0.15
 DEFAULT_GRIPPER_SPEED = 0.1
 DEFAULT_GRIPPER_FORCE = 50.0
-POLL_DT_S = 0.05
+CONTROLLER_WAIT_DT_S = 0.05
+CONTROLLER_WAIT_TIMEOUT_S = 30.0
 
 
 class Phase(enum.Enum):
@@ -160,11 +161,22 @@ def validate_config(redis_client) -> int | None:
 
 
 def _ensure_cartesian_controller(redis_client) -> None:
-    while (
-        _decode_redis_value(redis_client.get(_KEYS.active_controller))
-        != CONTROLLER_TO_USE
-    ):
+    t0 = time.monotonic()
+    while True:
+        if (
+            _decode_redis_value(redis_client.get(_KEYS.active_controller))
+            == CONTROLLER_TO_USE
+        ):
+            return
+        if time.monotonic() - t0 > CONTROLLER_WAIT_TIMEOUT_S:
+            print(
+                f"Warning: could not switch active_controller to {CONTROLLER_TO_USE!r} "
+                f"within {CONTROLLER_WAIT_TIMEOUT_S:.0f} s; publishing goals anyway.",
+                file=sys.stderr,
+            )
+            return
         redis_client.set(_KEYS.active_controller, CONTROLLER_TO_USE)
+        time.sleep(CONTROLLER_WAIT_DT_S)
 
 
 def _publish_cartesian(
@@ -254,7 +266,7 @@ def parse_args() -> argparse.Namespace:
 
 def _phase_hint(phase: Phase) -> str:
     if phase == Phase.ABOVE_PICK:
-        return "Next: ENTER = descend to pick pose"
+        return "Next: ENTER = descend in Z to pick pose"
     if phase == Phase.AT_PICK:
         return "Next: ENTER = close gripper"
     if phase == Phase.CLOSED:
@@ -262,11 +274,11 @@ def _phase_hint(phase: Phase) -> str:
     if phase == Phase.LIFTED:
         return "Next: ENTER = move above place pose"
     if phase == Phase.ABOVE_PLACE:
-        return "Next: ENTER = descend to place pose"
+        return "Next: ENTER = descend in Z to place pose"
     if phase == Phase.AT_PLACE:
         return "Next: ENTER = open gripper"
     if phase == Phase.DONE:
-        return "Done — q to quit"
+        return "Sequence complete — q to quit"
     return ""
 
 
@@ -296,15 +308,18 @@ def _do_move_above(
     return above
 
 
-def _do_descend(
+def _do_descend_z_only(
     redis_client,
-    target_pos: np.ndarray,
+    xy: np.ndarray,
+    target_z: float,
     ee_ori: np.ndarray,
     *,
     label: str,
-) -> None:
-    _publish_cartesian(redis_client, target_pos, ee_ori)
-    print(f"{label} Descend: pos={target_pos.tolist()}")
+) -> np.ndarray:
+    goal = np.array([float(xy[0]), float(xy[1]), float(target_z)], dtype=np.float64)
+    _publish_cartesian(redis_client, goal, ee_ori)
+    print(f"{label} Descend (Z only): pos={goal.tolist()}")
+    return goal
 
 
 def _do_close_gripper(redis_client, motion: MotionParams) -> None:
@@ -344,20 +359,15 @@ def _do_open_gripper(redis_client, motion: MotionParams) -> None:
     print(f"[6] Open gripper (mode=o): width={open_w:.4f} m max")
 
 
-_STDIN_EOF = object()
-
-
-def _stdin_line_ready(timeout_s: float):
+def _read_command(phase: Phase) -> str | None:
+    """Block until the user presses ENTER (or types q). Returns None on EOF."""
+    hint = _phase_hint(phase)
+    prompt = f"\n[{phase.value}] {hint}\n> "
     try:
-        ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
-    except (ValueError, OSError):
-        return _STDIN_EOF
-    if not ready:
+        sys.stdout.flush()
+        return input(prompt)
+    except EOFError:
         return None
-    line = sys.stdin.readline()
-    if line == "":
-        return _STDIN_EOF
-    return line
 
 
 def run_loop(
@@ -386,7 +396,14 @@ def run_loop(
         f"Place pos = {place_pos.tolist()}\n"
         f"EE ori (fixed) =\n{np.array2string(ee_ori, precision=4, suppress_small=True)}"
     )
-    print("Keys (ENTER to submit): [empty]=advance phase | q=quit")
+    if not sys.stdin.isatty():
+        print(
+            "Warning: stdin is not a terminal (ENTER may not work). Run in a real shell:\n"
+            "  python3 -u ZitiBot/controllers/grasp_and_place_controller.py",
+            file=sys.stderr,
+            flush=True,
+        )
+    print("Keys: press ENTER (empty line) to advance | q=quit", flush=True)
 
     _do_move_above(
         redis_client,
@@ -397,26 +414,19 @@ def run_loop(
         open_gripper=True,
     )
     phase = Phase.ABOVE_PICK
-    stdin_dead = False
-    print(_phase_hint(phase))
+    print(_phase_hint(phase), flush=True)
 
     try:
         while True:
-            if stdin_dead:
-                time.sleep(POLL_DT_S)
-                continue
-
-            line = _stdin_line_ready(POLL_DT_S)
+            line = _read_command(phase)
             if line is None:
-                continue
-            if line is _STDIN_EOF:
                 print(
-                    "stdin closed (no terminal attached). State will NOT advance.\n"
-                    "Run this controller directly in a terminal. Ctrl+C to quit.",
+                    "stdin closed — run this script in an interactive terminal "
+                    "(not backgrounded). Ctrl+C to quit.",
                     file=sys.stderr,
+                    flush=True,
                 )
-                stdin_dead = True
-                continue
+                return 0
             token = line.strip().lower()
             if token in ("q", "quit", "exit"):
                 print("Quit requested.")
@@ -426,7 +436,13 @@ def run_loop(
                 continue
 
             if phase == Phase.ABOVE_PICK:
-                _do_descend(redis_client, pick_pos, ee_ori, label="[1]")
+                _do_descend_z_only(
+                    redis_client,
+                    pick_pos[:2],
+                    float(pick_pos[2]),
+                    ee_ori,
+                    label="[1]",
+                )
                 phase = Phase.AT_PICK
             elif phase == Phase.AT_PICK:
                 _do_close_gripper(redis_client, motion)
@@ -445,15 +461,23 @@ def run_loop(
                 )
                 phase = Phase.ABOVE_PLACE
             elif phase == Phase.ABOVE_PLACE:
-                _do_descend(redis_client, place_pos, ee_ori, label="[5]")
+                _do_descend_z_only(
+                    redis_client,
+                    place_pos[:2],
+                    float(place_pos[2]),
+                    ee_ori,
+                    label="[5]",
+                )
                 phase = Phase.AT_PLACE
             elif phase == Phase.AT_PLACE:
                 _do_open_gripper(redis_client, motion)
                 phase = Phase.DONE
+                print("Sequence complete.", flush=True)
             elif phase == Phase.DONE:
-                print("Sequence done — q to quit.")
+                pass
 
-            print(_phase_hint(phase))
+            if phase != Phase.DONE:
+                print(_phase_hint(phase), flush=True)
     except KeyboardInterrupt:
         print("\nKeyboard interrupt.")
         return 0

@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Fixed-pose grasp + lift/pour on OpenSai Franka (Redis only).
+"""Fixed-pose grasp + transport/pour on OpenSai Franka (Redis only).
 
-Grasp pose is a fixed cartesian pose (same numeric values as the ``touch_controller``
-home pose, but here it is the **grasp** target). No Gemini, no camera. Every state
+Pick and pour poses are fixed in the world frame. No Gemini, no camera. Every state
 transition is **manually gated by ENTER**.
 
-Startup (no ENTER): immediately move **above** the grasp pose (``+lift-dz`` in
-world Z) with the gripper **open**.
+Startup (no ENTER): move **above** the pick pose (pick XY, Z = pick Z + ``--approach-dz``)
+with the gripper **open**.
 
 Then one ENTER per step:
 
-- ENTER (1) — descend to the grasp pose.
-- ENTER (2) — close gripper.
-- ENTER (3) — lift +Z by ``--lift-dz``.
-- ENTER (4) — start pour slerp (+90° about world +X); runs to completion automatically.
-- ``q`` (then ENTER) / Ctrl+C — quit.
+- ENTER (1) — descend to the pick pose.
+- ENTER (2) — close gripper (held until step 8; no re-open in between).
+- ENTER (3) — move directly to the pour pose.
+- ENTER (4) — start pour slerp (``--pour-tilt-deg``, default 90° about world +X) at pour pose.
+- ENTER (5) — return orientation to grasp (reverse slerp at pour pose).
+- ENTER (6) — retract vertically at pour site (clearance height).
+- ENTER (7) — move to original pick position (bowl placement).
+- ENTER (8) — open gripper to release the bowl.
+- ``q`` / Ctrl+C — quit.
 
 Requires OpenSai ``cartesian_controller``, Franka arm driver, and Franka gripper
 Redis driver (``opensai::FrankaRobot::gripper::*``).
@@ -22,7 +25,7 @@ Redis driver (``opensai::FrankaRobot::gripper::*``).
 Usage::
 
   python ZitiBot/controllers/grasp_and_pour_controller.py
-  python ZitiBot/controllers/grasp_and_pour_controller.py --lift-dz 0.12
+  python ZitiBot/controllers/grasp_and_pour_controller.py --approach-dz 0.15
 """
 
 from __future__ import annotations
@@ -82,12 +85,13 @@ GRIPPER_MODE_OPEN_MAX = "o"  # snap fully open
 
 _KEYS = _RedisKeys()
 
-# Fixed grasp pose (same numbers as touch_controller's home pose; kept in sync
-# manually — do not import touch_controller because it has Redis side effects at
-# module load).
+# Fixed pick / pour poses (world frame, meters). EE orientation is fixed for the
+# whole sequence (tool Z down, 45° yaw) except during pour slerp.
 _GRASP_YAW_RAD = np.radians(45.0)
 _c, _s = np.cos(_GRASP_YAW_RAD), np.sin(_GRASP_YAW_RAD)
-GRASP_POSITION = np.array([0.4, -0.2, 0.35])
+PICK_POSITION = np.array([0.49764, 0.436106, 0.369818])
+POUR_POSITION = np.array([0.522549, 0.115722, 0.628443])
+GRASP_POSITION = PICK_POSITION  # alias used by descend/return helpers
 GRASP_ORIENTATION = np.array(
     [
         [_c, -_s, 0.0],
@@ -96,10 +100,17 @@ GRASP_ORIENTATION = np.array(
     ]
 )
 
-DEFAULT_LIFT_DZ_M = 0.15
+DEFAULT_APPROACH_DZ_M = 0.15
+DEFAULT_POUR_TILT_DEG = 90.0
+DEFAULT_POUR_AXIS = "x"
 DEFAULT_TILT_DURATION_S = 6.0
 DEFAULT_GRIPPER_SPEED = 0.1
 DEFAULT_GRIPPER_FORCE = 50.0
+DEFAULT_GRIPPER_PREGRASP_WIDTH = 0.05
+DEFAULT_GRIPPER_PREGRASP_SETTLE_S = 0.6
+DEFAULT_GRIPPER_GRASP_SETTLE_S = 1.2
+DEFAULT_POS_TOL_M = 0.03
+DEFAULT_TRANSIT_DWELL_S = 2.5
 POUR_TICK_DT_S = 0.05
 
 
@@ -109,22 +120,34 @@ class Phase(enum.Enum):
     CLOSED = "CLOSED"
     LIFTED = "LIFTED"
     POURING = "POURING"
+    POURED = "POURED"
+    RETURNING = "RETURNING"
+    RETURNED = "RETURNED"
+    ABOVE_PICK_RETURN = "ABOVE_PICK_RETURN"
+    AT_RETURN = "AT_RETURN"
     DONE = "DONE"
 
 
 @dataclass
 class MotionParams:
-    lift_dz_m: float
+    approach_dz_m: float
+    pour_tilt_deg: float
+    pour_axis: str
     tilt_duration_s: float
     gripper_open_width: float | None
+    gripper_pregrasp_width: float
     gripper_close_width: float
     gripper_speed: float
     gripper_force: float
+    gripper_pregrasp_settle_s: float
+    gripper_grasp_settle_s: float
 
 
 @dataclass
-class PourState:
-    lift_world: np.ndarray
+class OrientationSlerpState:
+    """Hold position fixed while interpolating orientation (pour or return)."""
+
+    hold_world: np.ndarray
     R_start: np.ndarray
     R_end: np.ndarray
     t0: float
@@ -252,10 +275,18 @@ def resolve_gripper_open_width(redis_client, override: float | None) -> float:
     return 0.08
 
 
-def pour_orientation_end(R_start: np.ndarray) -> np.ndarray:
-    """+90° about world +X."""
-    R_x = R.from_euler("x", math.pi / 2.0).as_matrix()
-    return R_x @ np.asarray(R_start, dtype=np.float64).reshape(3, 3)
+def pour_orientation_end(
+    R_start: np.ndarray, tilt_deg: float, axis: str = DEFAULT_POUR_AXIS
+) -> np.ndarray:
+    """Pour tilt: rotation about world +X or +Y by ``tilt_deg`` (default +X)."""
+    ax = axis.strip().lower()
+    if ax == "x":
+        R_tilt = R.from_euler("x", math.radians(tilt_deg)).as_matrix()
+    elif ax == "y":
+        R_tilt = R.from_euler("y", math.radians(tilt_deg)).as_matrix()
+    else:
+        raise ValueError(f"Unknown pour axis {axis!r}; use 'x' or 'y'.")
+    return R_tilt @ np.asarray(R_start, dtype=np.float64).reshape(3, 3)
 
 
 def parse_args() -> argparse.Namespace:
@@ -264,7 +295,24 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--redis-host", default="localhost")
     p.add_argument("--redis-port", type=int, default=6379)
-    p.add_argument("--lift-dz", type=float, default=DEFAULT_LIFT_DZ_M)
+    p.add_argument(
+        "--approach-dz",
+        type=float,
+        default=DEFAULT_APPROACH_DZ_M,
+        help="Vertical clearance above pick for approach and return retract (m).",
+    )
+    p.add_argument(
+        "--pour-tilt-deg",
+        type=float,
+        default=DEFAULT_POUR_TILT_DEG,
+        help="Pour rotation about world +X (degrees); default 90.",
+    )
+    p.add_argument(
+        "--pour-axis",
+        choices=("x", "y"),
+        default=DEFAULT_POUR_AXIS,
+        help="World axis for pour tilt (default x).",
+    )
     p.add_argument("--tilt-duration", type=float, default=DEFAULT_TILT_DURATION_S)
     p.add_argument(
         "--gripper-open-width",
@@ -272,9 +320,26 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Open width (m); default reads gripper::max_width from Redis.",
     )
+    p.add_argument(
+        "--gripper-pregrasp-width",
+        type=float,
+        default=DEFAULT_GRIPPER_PREGRASP_WIDTH,
+        help="Partial open width before final grasp (m).",
+    )
     p.add_argument("--gripper-close-width", type=float, default=0.0)
     p.add_argument("--gripper-speed", type=float, default=DEFAULT_GRIPPER_SPEED)
     p.add_argument("--gripper-force", type=float, default=DEFAULT_GRIPPER_FORCE)
+    p.add_argument(
+        "--gripper-pregrasp-settle",
+        type=float,
+        default=DEFAULT_GRIPPER_PREGRASP_SETTLE_S,
+    )
+    p.add_argument(
+        "--gripper-grasp-settle",
+        type=float,
+        default=DEFAULT_GRIPPER_GRASP_SETTLE_S,
+        help="Wait after grasp command before moving arm (s).",
+    )
     return p.parse_args()
 
 
@@ -284,14 +349,29 @@ def _phase_hint(phase: Phase) -> str:
     if phase == Phase.AT_GRASP:
         return "Next: ENTER = close gripper"
     if phase == Phase.CLOSED:
-        return "Next: ENTER = lift +Z"
+        return "Next: ENTER = move to pour pose"
     if phase == Phase.LIFTED:
-        return "Next: ENTER = start pour (+90° world X)"
+        return "Next: ENTER = start pour (world +X tilt)"
     if phase == Phase.POURING:
         return "Pouring… (auto-completes)"
+    if phase == Phase.POURED:
+        return "Next: ENTER = return orientation to grasp"
+    if phase == Phase.RETURNING:
+        return "Returning orientation… (auto-completes)"
+    if phase == Phase.RETURNED:
+        return "Next: ENTER = retract up at pour site"
+    if phase == Phase.ABOVE_PICK_RETURN:
+        return "Next: ENTER = move to original pick position"
+    if phase == Phase.AT_RETURN:
+        return "Next: ENTER = open gripper (release bowl)"
     if phase == Phase.DONE:
         return "Done — q to quit"
     return ""
+
+
+def _above_pick(pick_pos: np.ndarray, motion: MotionParams) -> np.ndarray:
+    """Pick XY with vertical clearance for approach / retract."""
+    return pick_pos + np.array([0.0, 0.0, motion.approach_dz_m])
 
 
 def _do_move_above_grasp(
@@ -300,7 +380,8 @@ def _do_move_above_grasp(
     grasp_ori: np.ndarray,
     motion: MotionParams,
 ) -> np.ndarray:
-    above = grasp_pos + np.array([0.0, 0.0, motion.lift_dz_m])
+    """Startup only: approach pose with gripper open (sole open before final release)."""
+    above = _above_pick(grasp_pos, motion)
     _publish_cartesian(redis_client, above, grasp_ori)
     open_w = resolve_gripper_open_width(redis_client, motion.gripper_open_width)
     set_gripper_width(
@@ -321,76 +402,175 @@ def _do_descend_to_grasp(
     redis_client,
     grasp_pos: np.ndarray,
     grasp_ori: np.ndarray,
+    *,
+    label: str = "[1] Descend to grasp",
 ) -> None:
     _publish_cartesian(redis_client, grasp_pos, grasp_ori)
-    print(f"[1] Descend to grasp: pos={grasp_pos.tolist()}")
+    print(f"{label}: pos={grasp_pos.tolist()}")
 
 
-def _do_close_gripper(redis_client, motion: MotionParams) -> None:
+def _do_grasp_object(redis_client, motion: MotionParams) -> None:
+    """Pregrasp (move mode) then force grasp; wait before arm motion resumes."""
+    pre_w = float(motion.gripper_pregrasp_width)
     set_gripper_width(
         redis_client,
-        motion.gripper_close_width,
+        pre_w,
         speed=motion.gripper_speed,
         force=motion.gripper_force,
         mode=GRIPPER_MODE_MOVE,
     )
     print(
-        f"[2] Close gripper (move): width={motion.gripper_close_width:.4f} m, "
-        f"speed={motion.gripper_speed:.3f} m/s (mode=m)"
+        f"[2a] Pregrasp: width={pre_w:.4f} m (mode=m), "
+        f"settle {motion.gripper_pregrasp_settle_s:.1f} s"
     )
+    time.sleep(motion.gripper_pregrasp_settle_s)
+
+    set_gripper_width(
+        redis_client,
+        motion.gripper_close_width,
+        speed=motion.gripper_speed,
+        force=motion.gripper_force,
+        mode=GRIPPER_MODE_GRASP,
+    )
+    print(
+        f"[2b] Grasp: force={motion.gripper_force:.1f} N (mode=g), "
+        f"settle {motion.gripper_grasp_settle_s:.1f} s before moving"
+    )
+    time.sleep(motion.gripper_grasp_settle_s)
 
 
-def _do_lift(
+def _do_move_to_pour(
     redis_client,
-    grasp_pos: np.ndarray,
+    pour_pos: np.ndarray,
+    grasp_ori: np.ndarray,
+) -> np.ndarray:
+    """Move directly to the pour pose."""
+    pour = np.asarray(pour_pos, dtype=np.float64).reshape(3).copy()
+    _publish_cartesian(redis_client, pour, grasp_ori)
+    print(f"[3] Move to pour pose: pos={pour.tolist()}")
+    return pour
+
+
+def _do_retract_from_pour(
+    redis_client,
+    pour_pos: np.ndarray,
     grasp_ori: np.ndarray,
     motion: MotionParams,
 ) -> np.ndarray:
-    lift_world = grasp_pos + np.array([0.0, 0.0, motion.lift_dz_m])
-    _publish_cartesian(redis_client, lift_world, grasp_ori)
-    print(f"[3] Lift goal: {lift_world.tolist()}")
-    return lift_world
+    """Retract vertically at the pour site (pour XY, raised Z for clearance)."""
+    retract = np.asarray(pour_pos, dtype=np.float64).reshape(3).copy()
+    retract[2] = max(
+        float(pour_pos[2]),
+        float(_above_pick(PICK_POSITION, motion)[2]),
+    )
+    _publish_cartesian(redis_client, retract, grasp_ori)
+    print(f"[6] Retract at pour site: pos={retract.tolist()}")
+    return retract
+
+
+def _do_move_to_pick(
+    redis_client,
+    pick_pos: np.ndarray,
+    grasp_ori: np.ndarray,
+) -> np.ndarray:
+    """Move directly to the original pick pose."""
+    pick = np.asarray(pick_pos, dtype=np.float64).reshape(3).copy()
+    _publish_cartesian(redis_client, pick, grasp_ori)
+    print(f"[7] Move to original pick position: pos={pick.tolist()}")
+    return pick
+
+
+def _start_orientation_slerp(
+    redis_client,
+    hold_world: np.ndarray,
+    R_start: np.ndarray,
+    R_end: np.ndarray,
+    now: float,
+    *,
+    label: str,
+) -> OrientationSlerpState:
+    hold = np.asarray(hold_world, dtype=np.float64).reshape(3).copy()
+    R0 = np.asarray(R_start, dtype=np.float64).reshape(3, 3).copy()
+    R1 = np.asarray(R_end, dtype=np.float64).reshape(3, 3).copy()
+    _publish_cartesian(redis_client, hold, R0)
+    print(label)
+    return OrientationSlerpState(hold_world=hold, R_start=R0, R_end=R1, t0=now)
 
 
 def _start_pour(
     redis_client,
-    lift_world: np.ndarray,
+    pour_world: np.ndarray,
+    motion: MotionParams,
     now: float,
-) -> PourState | None:
+) -> OrientationSlerpState | None:
     pose = read_current_ee_world(redis_client)
     if pose is None:
         print("Could not read current EE pose from Redis; not starting pour.")
         return None
     _, cur_ori = pose
     R_start = cur_ori.copy()
-    R_end = pour_orientation_end(R_start)
-    _publish_cartesian(redis_client, lift_world, R_start)
-    print("[4] Pour started: slerp +90° about world X.")
-    return PourState(
-        lift_world=np.asarray(lift_world, dtype=np.float64).reshape(3).copy(),
-        R_start=R_start,
-        R_end=R_end,
-        t0=now,
+    R_end = pour_orientation_end(
+        R_start, motion.pour_tilt_deg, motion.pour_axis
+    )
+    return _start_orientation_slerp(
+        redis_client,
+        pour_world,
+        R_start,
+        R_end,
+        now,
+        label=(
+            f"[4] Pour started: slerp {motion.pour_tilt_deg:.0f}° "
+            f"about world +{motion.pour_axis.upper()}."
+        ),
     )
 
 
-def _tick_pour(
+def _start_return(
     redis_client,
-    pour: PourState,
+    pour_world: np.ndarray,
+    grasp_ori: np.ndarray,
+    poured_ori: np.ndarray,
+    now: float,
+) -> OrientationSlerpState:
+    return _start_orientation_slerp(
+        redis_client,
+        pour_world,
+        poured_ori,
+        grasp_ori,
+        now,
+        label="[5] Return started: slerp back to grasp orientation.",
+    )
+
+
+def _tick_orientation_slerp(
+    redis_client,
+    slerp: OrientationSlerpState,
     motion: MotionParams,
     now: float,
 ) -> bool:
-    """Advance pour slerp; return True when complete."""
-    if now - pour.last_tick < POUR_TICK_DT_S:
+    """Advance orientation slerp; return True when complete."""
+    if now - slerp.last_tick < POUR_TICK_DT_S:
         return False
-    pour.last_tick = now
-    alpha = min(1.0, max(0.0, (now - pour.t0) / motion.tilt_duration_s))
+    slerp.last_tick = now
+    alpha = min(1.0, max(0.0, (now - slerp.t0) / motion.tilt_duration_s))
     key_rots = R.concatenate(
-        [R.from_matrix(pour.R_start), R.from_matrix(pour.R_end)]
+        [R.from_matrix(slerp.R_start), R.from_matrix(slerp.R_end)]
     )
-    R_tilt = Slerp([0.0, 1.0], key_rots)([alpha]).as_matrix()[0]
-    _publish_cartesian(redis_client, pour.lift_world, R_tilt)
+    R_interp = Slerp([0.0, 1.0], key_rots)([alpha]).as_matrix()[0]
+    _publish_cartesian(redis_client, slerp.hold_world, R_interp)
     return alpha >= 1.0
+
+
+def _do_open_gripper(redis_client, motion: MotionParams) -> None:
+    open_w = resolve_gripper_open_width(redis_client, motion.gripper_open_width)
+    set_gripper_width(
+        redis_client,
+        open_w,
+        speed=motion.gripper_speed,
+        force=motion.gripper_force,
+        mode=GRIPPER_MODE_OPEN_MAX,
+    )
+    print(f"[8] Open gripper (mode=o): width={open_w:.4f} m max")
 
 
 _STDIN_EOF = object()
@@ -421,34 +601,47 @@ def _stdin_line_ready(timeout_s: float):
 def run_loop(redis_client, motion: MotionParams) -> int:
     open_w = resolve_gripper_open_width(redis_client, motion.gripper_open_width)
     motion = MotionParams(
-        lift_dz_m=motion.lift_dz_m,
+        approach_dz_m=motion.approach_dz_m,
+        pour_tilt_deg=motion.pour_tilt_deg,
+        pour_axis=motion.pour_axis,
         tilt_duration_s=motion.tilt_duration_s,
         gripper_open_width=open_w,
+        gripper_pregrasp_width=motion.gripper_pregrasp_width,
         gripper_close_width=motion.gripper_close_width,
         gripper_speed=motion.gripper_speed,
         gripper_force=motion.gripper_force,
+        gripper_pregrasp_settle_s=motion.gripper_pregrasp_settle_s,
+        gripper_grasp_settle_s=motion.gripper_grasp_settle_s,
     )
     print(
-        f"Motion: lift_dz={motion.lift_dz_m} m, "
-        f"tilt={motion.tilt_duration_s} s, gripper open={motion.gripper_open_width:.4f} m"
+        f"Motion: approach_dz={motion.approach_dz_m} m, "
+        f"pour_tilt={motion.pour_tilt_deg:.0f}° world +{motion.pour_axis.upper()}, "
+        f"tilt_dur={motion.tilt_duration_s} s, "
+        f"pregrasp={motion.gripper_pregrasp_width:.4f} m, "
+        f"gripper open={motion.gripper_open_width:.4f} m"
     )
 
-    grasp_pos = GRASP_POSITION.copy()
+    pick_pos = PICK_POSITION.copy()
+    pour_pos = POUR_POSITION.copy()
     grasp_ori = GRASP_ORIENTATION.copy()
     print(
-        f"Grasp pose:\n"
-        f"  pos = {grasp_pos.tolist()}\n"
-        f"  ori =\n{np.array2string(grasp_ori, precision=4, suppress_small=True)}"
+        f"Pick pose:\n"
+        f"  pos = {pick_pos.tolist()}\n"
+        f"Pour pose:\n"
+        f"  pos = {pour_pos.tolist()}\n"
+        f"EE ori (fixed, except pour slerp) =\n"
+        f"{np.array2string(grasp_ori, precision=4, suppress_small=True)}"
     )
     print(
         "Keys (ENTER to submit): "
         "[empty]=advance phase | q=quit"
     )
 
-    _do_move_above_grasp(redis_client, grasp_pos, grasp_ori, motion)
+    _do_move_above_grasp(redis_client, pick_pos, grasp_ori, motion)
     phase = Phase.ABOVE_GRASP
-    lift_world: np.ndarray | None = None
-    pour: PourState | None = None
+    pour_world: np.ndarray | None = None
+    slerp: OrientationSlerpState | None = None
+    poured_ori: np.ndarray | None = None
     stdin_dead = False
     print(_phase_hint(phase))
 
@@ -456,15 +649,22 @@ def run_loop(redis_client, motion: MotionParams) -> int:
         while True:
             now = time.perf_counter()
 
-            if phase == Phase.POURING and pour is not None:
-                if _tick_pour(redis_client, pour, motion, now):
-                    phase = Phase.DONE
-                    print("Pour complete (hold).")
+            if phase in (Phase.POURING, Phase.RETURNING) and slerp is not None:
+                if _tick_orientation_slerp(redis_client, slerp, motion, now):
+                    if phase == Phase.POURING:
+                        poured_ori = slerp.R_end.copy()
+                        phase = Phase.POURED
+                        slerp = None
+                        print("Pour complete (hold).")
+                    else:
+                        phase = Phase.RETURNED
+                        slerp = None
+                        print("Return orientation complete (at pour pose).")
                     print(_phase_hint(phase))
 
             if stdin_dead:
                 # stdin is closed (e.g., backgrounded by a launcher script).
-                # Stay alive so the pour can finish; user must Ctrl+C to quit.
+                # Stay alive so pour/return slerps can finish; Ctrl+C to quit.
                 time.sleep(POUR_TICK_DT_S)
                 continue
 
@@ -489,21 +689,43 @@ def run_loop(redis_client, motion: MotionParams) -> int:
                 continue
 
             if phase == Phase.ABOVE_GRASP:
-                _do_descend_to_grasp(redis_client, grasp_pos, grasp_ori)
+                _do_descend_to_grasp(redis_client, pick_pos, grasp_ori)
                 phase = Phase.AT_GRASP
             elif phase == Phase.AT_GRASP:
-                _do_close_gripper(redis_client, motion)
+                _do_grasp_object(redis_client, motion)
                 phase = Phase.CLOSED
             elif phase == Phase.CLOSED:
-                lift_world = _do_lift(redis_client, grasp_pos, grasp_ori, motion)
+                pour_world = _do_move_to_pour(redis_client, pour_pos, grasp_ori)
                 phase = Phase.LIFTED
             elif phase == Phase.LIFTED:
-                assert lift_world is not None
-                pour = _start_pour(redis_client, lift_world, now)
-                if pour is not None:
+                assert pour_world is not None
+                slerp = _start_pour(redis_client, pour_world, motion, now)
+                if slerp is not None:
                     phase = Phase.POURING
             elif phase == Phase.POURING:
                 print("Pour in progress — wait for it to finish.")
+            elif phase == Phase.POURED:
+                assert pour_world is not None and poured_ori is not None
+                slerp = _start_return(
+                    redis_client,
+                    pour_world,
+                    grasp_ori,
+                    poured_ori,
+                    now,
+                )
+                phase = Phase.RETURNING
+            elif phase == Phase.RETURNING:
+                print("Return in progress — wait for it to finish.")
+            elif phase == Phase.RETURNED:
+                _do_retract_from_pour(redis_client, pour_pos, grasp_ori, motion)
+                phase = Phase.ABOVE_PICK_RETURN
+            elif phase == Phase.ABOVE_PICK_RETURN:
+                _do_move_to_pick(redis_client, pick_pos, grasp_ori)
+                phase = Phase.AT_RETURN
+            elif phase == Phase.AT_RETURN:
+                _do_open_gripper(redis_client, motion)
+                phase = Phase.DONE
+                print("Bowl released at original pose.")
             elif phase == Phase.DONE:
                 print("Sequence done — q to quit.")
 
@@ -523,12 +745,17 @@ def main() -> int:
         return err
 
     motion = MotionParams(
-        lift_dz_m=args.lift_dz,
+        approach_dz_m=args.approach_dz,
+        pour_tilt_deg=args.pour_tilt_deg,
+        pour_axis=args.pour_axis,
         tilt_duration_s=args.tilt_duration,
         gripper_open_width=args.gripper_open_width,
+        gripper_pregrasp_width=args.gripper_pregrasp_width,
         gripper_close_width=args.gripper_close_width,
         gripper_speed=args.gripper_speed,
         gripper_force=args.gripper_force,
+        gripper_pregrasp_settle_s=args.gripper_pregrasp_settle,
+        gripper_grasp_settle_s=args.gripper_grasp_settle,
     )
     return run_loop(redis_client, motion)
 

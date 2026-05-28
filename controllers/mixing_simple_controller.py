@@ -314,6 +314,11 @@ def _parse_args() -> argparse.Namespace:
             "and OptiTrack pose so you can hardcode them for the next run."
         ),
     )
+    p.add_argument(
+        "--no-step", action="store_true",
+        help="Run continuously without pausing between states. "
+             "Default behaviour is to pause after each state and wait for Enter.",
+    )
     return p.parse_args()
 
 
@@ -412,8 +417,23 @@ def main() -> int:
     above_bowl_pos  = np.array([bowl_cx, bowl_cy, z_above_bowl])
     at_bowl_pos     = np.array([bowl_cx, bowl_cy, z_mix_ee])
 
+    pending_next = None  # _State | None — set when --step is waiting for Enter
+
+    def goto(next_st: _State) -> None:
+        nonlocal state, pending_next
+        if not args.no_step:
+            if pending_next is not next_st:
+                pending_next = next_st
+                print(f"\n  [step] {state.value} complete "
+                      f"— press Enter to continue → {next_st.value}")
+        else:
+            state = next_st
+
     _stdin_attrs = _setup_cbreak()
-    print("  [press 'p' at any time to print current vs desired EE position]")
+    hints = ["'p' = print EE status"]
+    if not args.no_step:
+        hints.append("Enter = advance to next state")
+    print(f"  [{' | '.join(hints)}]")
 
     try:
         while state != _State.DONE:
@@ -444,7 +464,7 @@ def main() -> int:
                 elif state == _State.ORIENT_TO_MIX:
                     orient_t0 = now
                     print(f"  SLERP R_grasp → R_mix over {args.orient_dur:.1f} s  "
-                          f"(holding {wait_pos.tolist()})")
+                          f"pos {wait_pos.tolist()} → {above_bowl_pos.tolist()}")
 
                 elif state == _State.APPROACH_BOWL:
                     print(f"  EE goal  : {above_bowl_pos.tolist()}")
@@ -491,7 +511,7 @@ def main() -> int:
                 _publish_cartesian(redis_client, wait_pos, R_grasp)
                 _set_gripper(redis_client, open_w, spd, frc)
                 if cur_pos is not None and np.linalg.norm(cur_pos - wait_pos) < args.pos_tol:
-                    state = _State.WAIT_RECEIVE
+                    goto(_State.WAIT_RECEIVE)
 
             elif state == _State.WAIT_RECEIVE:
                 _publish_cartesian(redis_client, wait_pos, R_grasp)
@@ -502,32 +522,36 @@ def main() -> int:
                     print(f"  [{elapsed:4.0f}s] Insert tool — {remaining:.0f} s left")
                     last_countdown = now
                 if elapsed >= args.receive_wait:
-                    state = _State.CLOSE_GRIPPER
+                    goto(_State.CLOSE_GRIPPER)
 
             elif state == _State.CLOSE_GRIPPER:
                 _publish_cartesian(redis_client, wait_pos, R_grasp)
                 _set_gripper(redis_client, close_w, spd, frc)
                 if now - gripper_cmd_t0 >= _GRIPPER_SETTLE_S:
-                    state = _State.ORIENT_TO_MIX
+                    goto(_State.ORIENT_TO_MIX)
 
             elif state == _State.ORIENT_TO_MIX:
-                alpha    = (now - orient_t0) / args.orient_dur
-                R_interp = _slerp(R_grasp, R_mix, alpha)
-                _publish_cartesian(redis_client, wait_pos, R_interp)
+                alpha     = (now - orient_t0) / args.orient_dur
+                a_clamped = min(1.0, max(0.0, alpha))
+                R_interp  = _slerp(R_grasp, R_mix, a_clamped)
+                # Move toward above_bowl_pos while rotating — avoids rotating in place
+                # at a kinematically poor configuration.
+                pos_interp = wait_pos + a_clamped * (above_bowl_pos - wait_pos)
+                _publish_cartesian(redis_client, pos_interp, R_interp)
                 if alpha >= 1.0:
-                    state = _State.APPROACH_BOWL
+                    goto(_State.APPROACH_BOWL)
 
             elif state == _State.APPROACH_BOWL:
                 _publish_cartesian(redis_client, above_bowl_pos, R_mix)
                 if cur_pos is not None and \
                         np.linalg.norm(cur_pos - above_bowl_pos) < args.pos_tol:
-                    state = _State.LOWER_INTO_BOWL
+                    goto(_State.LOWER_INTO_BOWL)
 
             elif state == _State.LOWER_INTO_BOWL:
                 _publish_cartesian(redis_client, at_bowl_pos, R_mix)
                 if cur_pos is not None and \
                         np.linalg.norm(cur_pos - at_bowl_pos) < args.pos_tol:
-                    state = _State.MIX
+                    goto(_State.MIX)
 
             elif state == _State.MIX:
                 t = now - mix_t0
@@ -542,13 +566,13 @@ def main() -> int:
                     print(f"  MIX {t:5.1f} / {args.mix_dur:.1f} s{pos_str}")
                     last_mix_print = now
                 if t >= args.mix_dur:
-                    state = _State.LIFT_FROM_BOWL
+                    goto(_State.LIFT_FROM_BOWL)
 
             elif state == _State.LIFT_FROM_BOWL:
                 _publish_cartesian(redis_client, above_bowl_pos, R_mix)
                 if cur_pos is not None and \
                         np.linalg.norm(cur_pos - above_bowl_pos) < args.pos_tol:
-                    state = _State.ORIENT_TO_GRASP
+                    goto(_State.ORIENT_TO_GRASP)
 
             elif state == _State.ORIENT_TO_GRASP:
                 # Hold above the bowl while SLERPing orientation back to R_grasp.
@@ -556,12 +580,12 @@ def main() -> int:
                 R_interp = _slerp(R_mix, R_grasp, alpha)
                 _publish_cartesian(redis_client, above_bowl_pos, R_interp)
                 if alpha >= 1.0:
-                    state = _State.RETURN_TO_WAIT
+                    goto(_State.RETURN_TO_WAIT)
 
             elif state == _State.RETURN_TO_WAIT:
                 _publish_cartesian(redis_client, wait_pos, R_grasp)
                 if cur_pos is not None and np.linalg.norm(cur_pos - wait_pos) < args.pos_tol:
-                    state = _State.WAIT_GRAB
+                    goto(_State.WAIT_GRAB)
 
             elif state == _State.WAIT_GRAB:
                 _publish_cartesian(redis_client, wait_pos, R_grasp)
@@ -571,18 +595,21 @@ def main() -> int:
                     print(f"  [{elapsed:4.0f}s] Grab the tool — {remaining:.0f} s left")
                     last_countdown = now
                 if elapsed >= args.release_wait:
-                    state = _State.OPEN_GRIPPER
+                    goto(_State.OPEN_GRIPPER)
 
             elif state == _State.OPEN_GRIPPER:
                 _publish_cartesian(redis_client, wait_pos, R_grasp)
                 _set_gripper(redis_client, open_w, spd, frc)
                 if now - gripper_cmd_t0 >= _GRIPPER_SETTLE_S:
-                    state = _State.DONE
+                    goto(_State.DONE)
 
             time.sleep(dt)
 
             key = _check_keypress()
-            if key == "p":
+            if key in ('\r', '\n') and pending_next is not None:
+                state = pending_next
+                pending_next = None
+            elif key == 'p':
                 _print_ee_status(redis_client, state.value, cur_pos)
 
     except KeyboardInterrupt:

@@ -45,10 +45,11 @@ def build_prompt(object_name: str | None, custom_prompt: str | None) -> str:
 
     return (
         f"In the image, locate the **{obj}**. "
-        f"Choose ONE graspable point on the visible outer rim/lip. "
+        f"Choose TWO distinct graspable points on the visible outer rim/lip. "
         f"Prefer the near/lower rim closest to the camera. "
+        f"These two points should define the orientation of the rim. "
         f"Reply with JSON only:\n"
-        f'[{{"point": [y, x], "label": "{obj}"}}]\n'
+        f'[{{"point": [y, x], "label": "{obj}_1"}}, {{"point": [y, x], "label": "{obj}_2"}}]\n'
         f"Coordinates must be normalized 0-1000 in [y, x] order."
     )
 
@@ -517,12 +518,12 @@ def query_color_depth_overlay(
     depth_patch_radius: int,
 ) -> tuple[
     np.ndarray | None,
-    tuple[float, float, float] | None,
+    list[tuple[float, float, float] | None],
 ]:
     """
     Returns:
         overlay image,
-        first camera-frame point
+        list of camera-frame points (empty if no points detected)
     """
 
     print("Sending frame to Gemini ER...")
@@ -565,7 +566,7 @@ def query_color_depth_overlay(
 
     metric_lines: list[str] | None = None
 
-    first_cam: tuple[float, float, float] | None = None
+    all_cams: list[tuple[float, float, float] | None] = []
 
     if points:
 
@@ -578,10 +579,7 @@ def query_color_depth_overlay(
             depth_patch_radius,
         )
 
-        for c in cams:
-            if c is not None:
-                first_cam = c
-                break
+        all_cams = cams
 
         for i, p in enumerate(points):
 
@@ -600,4 +598,4 @@ def query_color_depth_overlay(
         metric_lines=metric_lines,
     )
 
-    return overlay, first_cam
+    return overlay, all_cams

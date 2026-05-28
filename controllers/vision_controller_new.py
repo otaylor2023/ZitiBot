@@ -29,7 +29,7 @@ q:
 
 Launch (from repo root)::
 
-  ./ZitiBot/launch_zitibot_panda.sh controllers/vision_controller_new.py
+  ./ZitiBot/launch_zitibot_arm.sh controllers/vision_controller_new.py
 
 Optional controller args after ``--`` (see ``--goal-offset-*``, ``--no-goal-offset``).
 """
@@ -79,7 +79,7 @@ T_FLANGE_CAMERA = np.array([
 # Brute-force latch tweak in robot base/world frame (m). Z-up: down = negative Z.
 # Set ENABLE_GOAL_OFFSET = False to disable. Tune with --goal-offset-* on CLI.
 ENABLE_GOAL_OFFSET = True
-GOAL_OFFSET_WORLD_M = np.array([0.053, 0.0, -0.10], dtype=np.float64)
+GOAL_OFFSET_WORLD_M = np.array([0.03, 0.0, 0.09], dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -334,6 +334,65 @@ def camera_point_to_base(
     p_base_h = T_base_flange @ T_FLANGE_CAMERA @ p_cam_h
 
     return p_base_h[:3].copy()
+
+
+def compute_rim_yaw_rotation(
+    p1_base: np.ndarray,
+    p2_base: np.ndarray,
+    current_orientation: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """
+    Compute Z-axis rotation to align gripper with rim direction.
+    
+    Keeps the gripper pointing down (current roll/pitch), only rotates about Z.
+    
+    Args:
+        p1_base: First point on rim in base/world frame (3,)
+        p2_base: Second point on rim in base/world frame (3,)
+        current_orientation: Current 3x3 rotation matrix (for reference)
+    
+    Returns:
+        3x3 rotation matrix with only Z-axis rotation applied, or None if degenerate
+    """
+    
+    p1 = np.asarray(p1_base, dtype=np.float64).reshape(3)
+    p2 = np.asarray(p2_base, dtype=np.float64).reshape(3)
+    
+    # Rim tangent direction in XY plane
+    rim_vec = p2 - p1
+    rim_norm = np.linalg.norm(rim_vec)
+    
+    if rim_norm < 1e-6:
+        print("Warning: two rim points are too close, cannot compute orientation")
+        return None
+    
+    # Project rim to XY plane (ignore Z component)
+    rim_xy = rim_vec.copy()
+    rim_xy[2] = 0.0
+    rim_xy_norm = np.linalg.norm(rim_xy)
+    
+    if rim_xy_norm < 1e-6:
+        print("Warning: rim is vertical (Z-aligned), cannot compute XY rotation")
+        return None
+    
+    rim_xy = rim_xy / rim_xy_norm
+    
+    # Compute desired yaw angle (angle in XY plane)
+    desired_yaw = np.arctan2(rim_xy[1], rim_xy[0])
+    
+    # Build Z-rotation matrix
+    c = np.cos(desired_yaw)
+    s = np.sin(desired_yaw)
+    
+    R_z = np.array([
+        [c, -s, 0.0],
+        [s,  c, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    
+    print(f"  Z-axis rotation: yaw={np.degrees(desired_yaw):.2f}°, rim_xy_norm={rim_xy_norm:.4f}m")
+    
+    return R_z
 
 
 def _print_vec3(label: str, v: np.ndarray) -> None:
@@ -638,7 +697,7 @@ def run_live(args: argparse.Namespace, prompt: str, redis_client) -> int:
 
             if key == ord(" "):
 
-                overlay, point_camera = gp.query_color_depth_overlay(
+                overlay, points_camera = gp.query_color_depth_overlay(
                         client,
                         args.model,
                         prompt,
@@ -652,7 +711,7 @@ def run_live(args: argparse.Namespace, prompt: str, redis_client) -> int:
                 if overlay is not None:
                     latched_overlay = overlay
 
-                if point_camera is not None:
+                if points_camera is not None and len(points_camera) > 0:
 
                     T_base_flange = read_T_base_flange(
                         redis_client,
@@ -666,21 +725,53 @@ def run_live(args: argparse.Namespace, prompt: str, redis_client) -> int:
                         )
                         continue
 
-                    raw_goal_world = camera_point_to_base(
-                        T_base_flange,
-                        point_camera,
-                    )
+                    # Filter out None points (failed depth samples)
+                    valid_points_base = []
+                    for p_cam in points_camera:
+                        if p_cam is not None:
+                            p_base = camera_point_to_base(
+                                T_base_flange,
+                                p_cam,
+                            )
+                            valid_points_base.append(p_base)
+
+                    if len(valid_points_base) == 0:
+                        print("No valid 3D points detected (depth issues)")
+                        continue
+
+                    # Use first point as the goal position
+                    raw_goal_world = valid_points_base[0]
                     offset = goal_offset_world(args)
                     latched_goal_world = raw_goal_world + offset
 
-                    latched_goal_orientation = read_current_orientation(
-                        redis_client
-                    )
+                    # Get current orientation (gripper pointing down)
+                    current_orientation = read_current_orientation(redis_client)
+                    latched_goal_orientation = current_orientation
+                    
+                    # Apply Z-axis rotation from two rim points if available
+                    if len(valid_points_base) >= 2 and current_orientation is not None:
+                        print(f"Computing Z-axis rotation from {len(valid_points_base)} rim points")
+                        R_z = compute_rim_yaw_rotation(
+                            valid_points_base[0],
+                            valid_points_base[1],
+                            current_orientation,
+                        )
+                        if R_z is not None:
+                            # Apply Z-rotation: R_new = R_current @ R_z
+                            # This rotates the current gripper orientation about Z-axis
+                            latched_goal_orientation = current_orientation @ R_z
+                            print("  → Applied Z-axis rotation to current orientation")
+                        else:
+                            print("  → Z-rotation computation failed, keeping current orientation")
+                    else:
+                        print(f"Only {len(valid_points_base)} point(s) detected, keeping current orientation")
 
                     tcp_pose = read_current_tcp_world(redis_client)
                     tcp_pos = tcp_pose[0] if tcp_pose is not None else None
+                    
+                    # Log diagnostic with first point
                     log_tcp_camera_goal_diagnostic(
-                        point_camera=np.asarray(point_camera, dtype=np.float64),
+                        point_camera=np.asarray(points_camera[0], dtype=np.float64) if points_camera[0] is not None else np.zeros(3),
                         latched_goal_world=latched_goal_world,
                         T_base_flange=T_base_flange,
                         tcp_pos=tcp_pos,

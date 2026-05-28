@@ -33,13 +33,13 @@ from tidybot_base.se2 import (
 # Yaw commands do NOT need this offset — when both the start and target yaw
 # are in the marker frame, the offset cancels in the delta.
 #
-# Locked-in default ``-38.1 deg`` matches the current ``tidybot01`` rigid body
-# (settles around -38.1 → -38.5 deg empirically — see the live
+# Locked-in default ``+41.0 deg`` matches the current ``tidybot01`` rigid body
+# (settled around +41 deg empirically on 2026-05-28 — see the live
 # ``marker_offset_est_deg`` line in ``opti_nav.print_pose_log_block`` to
 # re-tune if you re-create the rigid body in Motive). Override via
 # ``--marker-yaw-offset-deg`` on ``opti_controller``, or by passing a
 # ``NavConfig(marker_yaw_offset_deg=...)`` to ``opti_nav``.
-DEFAULT_MARKER_YAW_OFFSET_DEG = -38.1
+DEFAULT_MARKER_YAW_OFFSET_DEG = 41.0
 
 # Legacy alias kept for backwards-compat with prior code/CLI.
 ROBOT_FRAME_ROT_DEG = DEFAULT_MARKER_YAW_OFFSET_DEG

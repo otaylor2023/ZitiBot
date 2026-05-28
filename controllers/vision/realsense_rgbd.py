@@ -103,8 +103,13 @@ def next_rgbd_frame(
     depth_frame = frames.get_depth_frame()
     if not color_frame or not depth_frame:
         return None
-    color_bgr = np.asanyarray(color_frame.get_data())
-    depth_u16 = np.asanyarray(depth_frame.get_data())
+    # IMPORTANT: np.asanyarray on a librealsense frame returns a view into
+    # SDK-owned memory. Once `frames`/`color_frame`/`depth_frame` go out of
+    # scope at function return, the SDK reclaims those buffers and the numpy
+    # views become dangling pointers -> use-after-free -> glibc heap
+    # corruption (`corrupted unsorted chunks`, SIGABRT). Always copy.
+    color_bgr = np.array(color_frame.get_data(), copy=True)
+    depth_u16 = np.array(depth_frame.get_data(), copy=True)
     depth_m = depth_u16.astype(np.float32) * depth_scale
     depth_vis = depth_uint16_to_colormap_bgr(depth_u16)
     return color_bgr, depth_m, depth_vis

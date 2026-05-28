@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Mixing controller — fully autonomous pickup-mix-putdown pipeline.
+"""Mixing controller — step-by-step pickup-mix-putdown with fixed poses.
+
+Like grasp_and_place_controller.py: ladle and bowl positions are hardcoded
+defaults (world frame, meters), overridable via --ladle-xyz / --bowl-xyz.
+Press Enter before each step. No camera or Gemini API required.
 
 Mirrors the sim mixing-task controller.cpp FSM, adapted for the real Franka arm:
   - Arm control  : OpenSAI cartesian controller (Redis goal_position/orientation)
   - Base motion  : TidyBot hb1::desired_pose / hb1::current_pose (Redis)
   - Gripper      : Franka gripper Redis driver (desired_width/speed/force)
-  - Object poses : provided via --ladle-xyz / --bowl-xyz, or detected interactively
-                   with Gemini + RealSense if either is omitted.
 
 FSM (12 states):
   MOVE_BASE_GRASP      navigate base to ladle; arm holds travel pose
@@ -23,15 +25,11 @@ FSM (12 states):
   EE_PLACE_LADLE       3-phase: hover+SLERP back → descend → open gripper
 
 Usage::
-  # Positions provided explicitly (no camera needed):
-  python controllers/mixing_full_controller.py \\
-      --ladle-xyz 0.75 0.68 0.508 --bowl-xyz 0.17 0.62 0.50
+  # Defaults (tune DEFAULT_* below for your lab):
+  python3 -u controllers/mixing_controller.py
 
-  # Detect ladle with camera; bowl position provided:
-  python controllers/mixing_full_controller.py --bowl-xyz 0.17 0.62 0.50
-
-  # Skip base navigation (test arm-only, e.g. TidyBot not running):
-  python controllers/mixing_full_controller.py \\
+  # Override poses:
+  python3 -u controllers/mixing_controller.py \\
       --ladle-xyz 0.75 0.68 0.508 --bowl-xyz 0.17 0.62 0.50 --skip-base
 """
 
@@ -41,25 +39,40 @@ import argparse
 import enum
 import json
 import math
-import select
+import os
 import sys
-import termios
 import time
-import tty
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from scipy.spatial.transform import Rotation as ScipyR, Slerp
+import redis
+
+try:
+    from scipy.spatial.transform import Rotation as ScipyR, Slerp
+except ImportError:
+    print(
+        "Missing dependency: scipy\n"
+        "  pip install scipy\n"
+        "  # or install all ZitiBot deps:\n"
+        "  pip install -r ZitiBot/requirements.txt",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 _CTRL_DIR = Path(__file__).resolve().parent
 if str(_CTRL_DIR) not in sys.path:
     sys.path.insert(0, str(_CTRL_DIR))
 
-import vision_controller as vc
+CONFIG_XML = os.environ.get("ZITIBOT_OPENSAI_CONFIG_XML", "zitibot_panda.xml")
+CONTROLLER_TO_USE = "cartesian_controller"
 
 # ── Defaults (all overridable via CLI) ─────────────────────────────────────────
-# Base targets [x, y, yaw_rad] in hb1 odometry frame — tune to your lab setup.
+# Fixed object poses in world frame (m) — tune to your lab setup.
+DEFAULT_LADLE_POSITION = (0.75, 0.68, 0.508)
+DEFAULT_BOWL_POSITION  = (0.17, 0.62, 0.50)
+
+# Base targets [x, y, yaw_rad] in hb1 odometry frame.
 _BASE_LADLE_DEFAULT  = (0.78, 0.22, math.pi / 2)
 _BASE_BOWL_DEFAULT   = (0.13, 0.22, math.pi / 2)
 
@@ -95,18 +108,27 @@ _GRIPPER_CLOSE_WIDTH_DEFAULT = 0.0
 _GRIPPER_SPEED_DEFAULT       = 0.1
 _GRIPPER_FORCE_DEFAULT       = 50.0
 
-# Camera detection.
-_CAM_WIDTH_DEFAULT  = 640
-_CAM_HEIGHT_DEFAULT = 480
-_CAM_FPS_DEFAULT    = 30
-_CAM_WARMUP_DEFAULT = 30
-_CAM_TIMEOUT_DEFAULT = 10000
-_DEPTH_PATCH_RADIUS  = 2
-
-
 # ── Redis keys ─────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
-class _Keys(vc.OpenSaiRedisKeys):
+class OpenSaiRedisKeys:
+    cartesian_task_goal_position: str = (
+        "opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::goal_position"
+    )
+    cartesian_task_goal_orientation: str = (
+        "opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::goal_orientation"
+    )
+    cartesian_task_current_position: str = (
+        "opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_position"
+    )
+    cartesian_task_current_orientation: str = (
+        "opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_orientation"
+    )
+    active_controller: str = "opensai::controllers::FrankaRobot::active_controller_name"
+    config_file_name: str = "::sai-interfaces-webui::config_file_name"
+
+
+@dataclass(frozen=True)
+class _Keys(OpenSaiRedisKeys):
     gripper_desired_width:  str = "opensai::FrankaRobot::gripper::desired_width"
     gripper_desired_speed:  str = "opensai::FrankaRobot::gripper::desired_speed"
     gripper_desired_force:  str = "opensai::FrankaRobot::gripper::desired_force"
@@ -156,10 +178,61 @@ def _wrap_angle(a: float) -> float:
 
 
 # ── Redis helpers ──────────────────────────────────────────────────────────────
+def _decode_redis_value(raw: bytes | str | None) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8")
+    return raw
+
+
+def _try_redis(host: str, port: int):
+    try:
+        r = redis.Redis(host=host, port=port, decode_responses=False)
+        r.ping()
+        return r
+    except Exception as e:
+        print(f"Redis connect failed ({e}).", file=sys.stderr)
+        return None
+
+
+def validate_config(redis_client) -> int | None:
+    raw = redis_client.get(_KEYS.config_file_name)
+    name = _decode_redis_value(raw)
+    if name is None:
+        print(
+            "Warning: ::sai-interfaces-webui::config_file_name not in Redis; "
+            "continuing anyway.",
+            file=sys.stderr,
+        )
+        return None
+    if name != CONFIG_XML:
+        print(
+            f"Expected webui config {CONFIG_XML!r} but Redis has {name!r}. "
+            "Set ZITIBOT_OPENSAI_CONFIG_XML if needed.",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+def read_current_ee_world(redis_client) -> tuple[np.ndarray, np.ndarray] | None:
+    try:
+        raw_p = redis_client.get(_KEYS.cartesian_task_current_position)
+        raw_o = redis_client.get(_KEYS.cartesian_task_current_orientation)
+        if raw_p is None or raw_o is None:
+            return None
+        cur_pos = np.array(json.loads(raw_p), dtype=np.float64).reshape(3)
+        cur_ori = np.array(json.loads(raw_o), dtype=np.float64).reshape(3, 3)
+        return cur_pos, cur_ori
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
 def _ensure_cartesian(redis_client) -> None:
     raw = redis_client.get(_KEYS.active_controller)
-    if raw is None or raw.decode("utf-8") != vc.CONTROLLER_TO_USE:
-        redis_client.set(_KEYS.active_controller, vc.CONTROLLER_TO_USE)
+    if _decode_redis_value(raw) != CONTROLLER_TO_USE:
+        redis_client.set(_KEYS.active_controller, CONTROLLER_TO_USE)
 
 
 def _publish_cartesian(redis_client, pos: np.ndarray, ori: np.ndarray) -> None:
@@ -236,131 +309,59 @@ def _gripper_converged(redis_client, target_w: float, tol: float) -> bool:
     return w is not None and abs(w - target_w) < tol
 
 
-# ── Calibration helpers ────────────────────────────────────────────────────────
-def _read_optitrack(redis_client) -> str:
-    lines = []
-    for key, label in (("tidybot01::pos", "optitrack pos"),
-                       ("tidybot01::ori", "optitrack ori")):
-        raw = redis_client.get(key)
-        if raw is not None:
-            try:
-                lines.append(f"    {label:14s}: {json.loads(raw)}")
-            except Exception:
-                pass
-    return "\n".join(lines) if lines else "    (OptiTrack keys not found in Redis)"
+# ── Step-by-step prompts ─────────────────────────────────────────────────────
+class _StepAbort(Exception):
+    pass
 
 
-def _log_calib_snapshot(redis_client, label: str,
-                        calib_log: dict,
-                        ee_pos: np.ndarray | None,
-                        base: np.ndarray | None = None) -> None:
-    """Print and record the current EE position, base pose, and OptiTrack at a key moment."""
-    print(f"  [calib:{label}]")
-    if ee_pos is not None:
-        vec = [round(float(v), 4) for v in ee_pos]
-        print(f"    EE world pos   : {vec}")
-        calib_log[f"{label}_ee"] = vec
-    if base is not None:
-        bvec = [round(float(v), 4) for v in base]
-        print(f"    base pose      : {bvec}  (x, y, yaw_rad)")
-        calib_log[f"{label}_base"] = bvec
-    print(_read_optitrack(redis_client))
-
-
-def _print_calib_summary_full(
-    calib_log: dict,
-    ladle_pos: np.ndarray,
-    bowl_pos: np.ndarray,
-    z_mix_ee: float,
-    z_above_bowl: float,
-    base_ladle_goal: np.ndarray,
-    base_bowl_goal: np.ndarray,
-) -> None:
-    """Print a calibration box with every value needed to run without --relative."""
-    def fv(v) -> str:
-        return " ".join(f"{x:.4f}" for x in v)
-
-    W = 62  # inner width
-    def row(label: str, val: str) -> str:
-        content = f"  {label:<22s}{val}"
-        return f"║{content:<{W}}║"
-
-    sep   = f"╠{'═' * W}╣"
-    top   = f"╔{'═' * W}╗"
-    bot   = f"╚{'═' * W}╝"
-    title = f"║{'CALIBRATION SUMMARY — mixing_full_controller':^{W}}║"
-
-    lines = [top, title, sep]
-    lines.append(row("--ladle-xyz",    fv(ladle_pos)))
-    lines.append(row("--bowl-xyz",     fv(bowl_pos)))
-    lines.append(row("--z-mix-ee",     f"{z_mix_ee:.4f}"))
-    lines.append(row("--z-above-bowl", f"{z_above_bowl:.4f}"))
-    lines.append(row("--base-ladle",   fv(base_ladle_goal)))
-    lines.append(row("--base-bowl",    fv(base_bowl_goal)))
-
-    if calib_log:
-        lines.append(sep)
-        for label, val in calib_log.items():
-            lines.append(row(label, fv(val) if isinstance(val, (list, np.ndarray)) else str(val)))
-
-    lines.append(bot)
-    print("\n" + "\n".join(lines) + "\n")
-
-
-# ── Interactive keypress helpers ──────────────────────────────────────────────
-def _setup_cbreak() -> list | None:
+def _read_step_line(prompt: str) -> str | None:
+    """Read a line from the controlling terminal (works when stdin is piped)."""
     try:
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        tty.setcbreak(fd)
-        return old
-    except Exception:
+        if sys.stdin.isatty():
+            sys.stdout.flush()
+            return input(prompt)
+    except EOFError:
+        pass
+    try:
+        with open("/dev/tty", "r") as tty_in:
+            sys.stderr.write(prompt)
+            sys.stderr.flush()
+            return tty_in.readline()
+    except OSError:
         return None
 
 
-def _restore_stdin(old_attrs) -> None:
-    if old_attrs is not None:
-        try:
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_attrs)
-        except Exception:
-            pass
+def _wait_for_enter(step: str, detail: str = "", pause_sec: float = 0.0) -> bool:
+    """Block until Enter. Returns False if user quits or no terminal."""
+    msg = f"\n── {step} ──\n"
+    if detail:
+        msg += f"   {detail}\n"
+    if pause_sec > 0:
+        print(msg, end="", flush=True)
+        print(f"   (auto-pause {pause_sec:.1f} s — no Enter needed)", flush=True)
+        time.sleep(pause_sec)
+        return True
+    msg += "   Press Enter to continue (q to quit): "
+    line = _read_step_line(msg)
+    if line is None:
+        print(
+            "\nERROR: No interactive terminal for step input.\n"
+            "  Run in a real shell, e.g.:\n"
+            "    python3 -u controllers/mixing_controller.py --ladle-xyz ... --bowl-xyz ...\n"
+            "  Or pass --pause-sec 3 to insert timed pauses without Enter.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    if line.strip().lower() in ("q", "quit", "exit"):
+        print("Quit requested.")
+        return False
+    return True
 
 
-def _check_keypress() -> str | None:
-    try:
-        if select.select([sys.stdin], [], [], 0)[0]:
-            return sys.stdin.read(1)
-    except Exception:
-        pass
-    return None
-
-
-def _print_ee_status(redis_client, state_name: str,
-                     cur_pos: np.ndarray | None,
-                     base: np.ndarray | None = None) -> None:
-    """Print current vs desired EE position and base pose."""
-    raw_goal = redis_client.get(_KEYS.cartesian_task_goal_position)
-    goal_pos = None
-    if raw_goal is not None:
-        try:
-            goal_pos = json.loads(raw_goal)
-        except Exception:
-            pass
-
-    print(f"\n  [EE status | state={state_name}]")
-    if goal_pos is not None:
-        print(f"    desired EE : {[round(v, 4) for v in goal_pos]}")
-    else:
-        print("    desired EE : (not published yet)")
-    if cur_pos is not None:
-        print(f"    current EE : {[round(float(v), 4) for v in cur_pos]}")
-        if goal_pos is not None:
-            err = np.linalg.norm(cur_pos - np.array(goal_pos))
-            print(f"    EE error   : {err:.4f} m")
-    else:
-        print("    current EE : (Redis EE pose unavailable)")
-    if base is not None:
-        print(f"    base pose  : {[round(float(v), 4) for v in base]}  (x, y, yaw_rad)")
+def _step_pause(step: str, detail: str, args) -> None:
+    if not _wait_for_enter(step, detail, pause_sec=args.pause_sec):
+        raise _StepAbort()
 
 
 # ── FSM ───────────────────────────────────────────────────────────────────────
@@ -380,153 +381,228 @@ class _State(enum.Enum):
     DONE               = "DONE"
 
 
-# ── Gemini detection phase ─────────────────────────────────────────────────────
-def _detect_objects(
+# ── Manual step-by-step FSM (Enter between steps; like grasp_and_place) ─────
+def _run_fsm_manual(
     redis_client,
     args,
-    need_ladle: bool,
-    need_bowl: bool,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Interactive camera loop to latch ladle and/or bowl world positions.
+    ladle_pos: np.ndarray,
+    bowl_pos: np.ndarray,
+) -> int:
+    """Publish one step per Enter; you decide when the robot is ready to advance."""
+    ladle_grasp_offset = np.array(args.ladle_offset, dtype=np.float64)
+    bowl_cx, bowl_cy, bowl_cz = bowl_pos
 
-    Returns (ladle_xyz, bowl_xyz) — entries that were already provided via CLI
-    are passed through unchanged; only the ones flagged as needed are detected.
+    z_mix_ee = (args.z_mix_ee if args.z_mix_ee is not None
+                else round(bowl_cz + 0.283, 4))
+    z_above_bowl = (args.z_above_bowl if args.z_above_bowl is not None
+                    else round(z_mix_ee + 0.10, 4))
 
-    Keys:
-      SPACE — query Gemini for the *next* needed object (ladle first, then bowl)
-      's'   — save current overlay image
-      'g' / ENTER — accept latched positions and proceed
-      'q' / ESC   — quit
-    """
-    try:
-        import cv2
-        from vision import gemini_pointing as gp
-        from vision import realsense_rgbd as rs_cam
-    except ImportError as e:
-        print(f"Camera detection unavailable ({e}). "
-              "Provide --ladle-xyz and --bowl-xyz explicitly.", file=sys.stderr)
-        return None, None
+    base_ladle_goal = np.array(args.base_ladle, dtype=np.float64)
+    base_bowl_goal = np.array(args.base_bowl, dtype=np.float64)
 
-    client = gp.make_genai_client(gp.resolve_api_key())
+    R_grasp = _link7_orientation_world(0.0, 0.0, 45.0)
+    R_mix = _ladle_mixing_orientation()
 
-    T_ee_cam = (gp.load_T_ee_cam(args.ee_from_cam_json)
-                if args.ee_from_cam_json is not None
-                else gp.PLACEHOLDER_T_EE_CAM.copy())
+    open_w = _gripper_open_width(redis_client, args.gripper_open_width)
+    close_w = args.gripper_close_width
+    spd, frc = args.gripper_speed, args.gripper_force
+    dt = 1.0 / max(1, args.loop_hz)
 
-    pipeline = None
-    try:
-        pipeline, align, depth_scale, color_intrinsics = rs_cam.start_realsense(
-            args.cam_width, args.cam_height, args.cam_fps,
-            args.cam_warmup, args.cam_timeout,
+    def grasp_w() -> np.ndarray:
+        return ladle_pos + ladle_grasp_offset
+
+    def hover_w() -> np.ndarray:
+        return grasp_w() + np.array([0.0, 0.0, args.hover_dz])
+
+    def lift_w() -> np.ndarray:
+        return grasp_w() + np.array([0.0, 0.0, args.lift_dz])
+
+    above_bowl_pos = np.array([bowl_cx, bowl_cy, z_above_bowl])
+    at_bowl_pos = np.array([bowl_cx, bowl_cy, z_mix_ee])
+
+    print("\n=== Mixing Controller (step-by-step) ===")
+    print("  Each Enter publishes the next goal. Watch the robot, then press Enter.")
+    print("  Timed steps (orient / mix / dwells) run automatically after you start them.")
+    print(f"  ladle pos : {ladle_pos.tolist()}")
+    print(f"  bowl pos  : {bowl_pos.tolist()}")
+    print(f"  skip_base : {args.skip_base}")
+    print("  Keys: Enter = next step | q = quit")
+    print("==============================\n")
+
+    pose = read_current_ee_world(redis_client)
+    if pose is None:
+        print(
+            "WARNING: Redis EE pose unavailable — arm may not move. "
+            "Is OpenSAI running with the cartesian controller?",
+            file=sys.stderr,
+            flush=True,
         )
-    except Exception as e:
-        print(f"RealSense startup failed: {e}", file=sys.stderr)
-        return None, None
+    else:
+        print(f"  EE now: {pose[0].tolist()}\n", flush=True)
 
-    win = "Mixing — detect objects (SPACE=detect, g/Enter=go, q=quit)"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, 1280, 480)
+    def publish(pos: np.ndarray, ori: np.ndarray, grip: tuple[float, float, float] | None) -> None:
+        _publish_cartesian(redis_client, pos, ori)
+        if grip is not None:
+            _set_gripper(redis_client, grip[0], grip[1], grip[2])
+        print(f"  → goal pos: {np.asarray(pos).reshape(3).tolist()}", flush=True)
 
-    ladle_xyz: np.ndarray | None = None
-    bowl_xyz:  np.ndarray | None = None
-    latched_overlay: np.ndarray | None = None
-    miss_counter = [0]
+    def run_timed(step: str, detail: str, duration: float, tick) -> None:
+        _step_pause(step, detail + f"  [{duration:.1f} s motion starts on Enter]", args)
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < duration:
+            tick(time.perf_counter() - t0)
+            time.sleep(dt)
+        print(f"  ✓ {step} timed motion finished ({duration:.1f} s)", flush=True)
 
-    # Decide detection order.
-    pending = []
-    if need_ladle:
-        pending.append("ladle")
-    if need_bowl:
-        pending.append("bowl")
-    detecting = pending[0] if pending else None
-
-    print(f"\nDetection phase. Press SPACE to detect '{detecting}'. "
-          "g/Enter to accept. q to quit.")
+    closed = (close_w, spd, frc)
+    opened = (open_w, spd, frc)
 
     try:
-        while True:
-            triple = rs_cam.next_rgbd_frame(
-                pipeline, align, depth_scale, args.cam_timeout,
-                miss_counter, max_misses=10,
+        _step_pause(
+            "START",
+            "Pipeline ready. Ensure OpenSAI + (optional) TidyBot base are running.",
+            args,
+        )
+
+        if not args.skip_base:
+            pose = read_current_ee_world(redis_client)
+            hold_pos = pose[0] if pose is not None else np.zeros(3)
+            hold_ori = pose[1] if pose is not None else np.eye(3)
+            _step_pause(
+                "MOVE_BASE_GRASP",
+                f"Drive base to ladle {base_ladle_goal.tolist()}. "
+                "Press Enter when the base has arrived.",
+                args,
             )
-            if triple is None:
-                continue
-            color_bgr, depth_m, depth_vis = triple
-            h, w = color_bgr.shape[:2]
+            publish(hold_pos, hold_ori, closed)
+            _publish_base_goal(redis_client, base_ladle_goal)
+            print(f"  → base goal: {base_ladle_goal.tolist()}", flush=True)
+        else:
+            print("  (skip_base: base navigation steps omitted)", flush=True)
 
-            panel = (latched_overlay.copy()
-                     if latched_overlay is not None and latched_overlay.shape[:2] == (h, w)
-                     else np.full((h, w, 3), (48, 48, 52), dtype=np.uint8))
+        _step_pause(
+            "EE_ABOVE_LADLE",
+            f"Move EE above ladle hover {hover_w().tolist()}, gripper open.",
+            args,
+        )
+        publish(hover_w(), R_grasp, opened)
 
-            # Status overlay.
-            status = (f"Detect: {detecting}  |  ladle={'OK' if ladle_xyz is not None else '?'}"
-                      f"  bowl={'OK' if bowl_xyz is not None else '?'}"
-                      f"  |  g/Enter=go  q=quit")
-            cv2.putText(color_bgr, status, (10, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
-            cv2.imshow(win, np.hstack((color_bgr, depth_vis, panel)))
-            key = cv2.waitKey(1) & 0xFF
+        _step_pause("EE_GRASP_LADLE — descend", "Descend to grasp pose.", args)
+        publish(grasp_w(), R_grasp, opened)
 
-            if key in (ord("q"), 27):
-                print("Detection cancelled.")
-                return None, None
+        _step_pause(
+            "EE_GRASP_LADLE — dwell open",
+            f"Hold at grasp with gripper open ({args.grasp_open_dwell:.1f} s).",
+            args,
+        )
+        publish(grasp_w(), R_grasp, opened)
+        time.sleep(args.grasp_open_dwell)
 
-            if key in (ord("g"), 10, 13):
-                # Allow proceeding if all needed positions are latched.
-                still_needed = (need_ladle and ladle_xyz is None) or \
-                               (need_bowl  and bowl_xyz  is None)
-                if still_needed:
-                    print(f"Still need: "
-                          f"{'ladle ' if need_ladle and ladle_xyz is None else ''}"
-                          f"{'bowl'  if need_bowl  and bowl_xyz  is None else ''}. "
-                          "Press SPACE to detect.")
-                else:
-                    break
+        _step_pause("EE_GRASP_LADLE — close", "Close gripper on handle.", args)
+        publish(grasp_w(), R_grasp, closed)
+        time.sleep(_GRIPPER_SETTLE_S)
 
-            if key == ord("s") and latched_overlay is not None:
-                vc._save_overlay(latched_overlay)
+        _step_pause(
+            "EE_GRASP_LADLE — dwell closed",
+            f"Hold closed ({args.grasp_close_dwell:.1f} s).",
+            args,
+        )
+        publish(grasp_w(), R_grasp, closed)
+        time.sleep(args.grasp_close_dwell)
 
-            if key == ord(" ") and detecting is not None:
-                overlay, first_ee = gp.query_color_depth_overlay(
-                    client, args.model, gp.build_prompt(detecting, None),
-                    args.temperature, color_bgr, depth_m,
-                    color_intrinsics, T_ee_cam, _DEPTH_PATCH_RADIUS,
-                )
-                if overlay is not None and first_ee is not None:
-                    pose = vc.read_current_ee_world(redis_client)
-                    if pose is not None:
-                        cur_pos, cur_ori = pose
-                        p_ee = np.asarray(first_ee, dtype=np.float64).reshape(3)
-                        world_xyz = (cur_ori @ p_ee) + cur_pos
-                        latched_overlay = overlay
-                        if detecting == "ladle":
-                            ladle_xyz = world_xyz
-                            print(f"  Ladle latched: {world_xyz.tolist()}")
-                        else:
-                            bowl_xyz = world_xyz
-                            print(f"  Bowl latched:  {world_xyz.tolist()}")
-                        # Advance to next pending object.
-                        pending_remaining = [p for p in pending
-                                             if (p == "ladle" and ladle_xyz is None) or
-                                                (p == "bowl"  and bowl_xyz  is None)]
-                        detecting = pending_remaining[0] if pending_remaining else None
-                        if detecting:
-                            print(f"  Now detect '{detecting}' — press SPACE.")
-                    else:
-                        print("  Redis EE pose unavailable; cannot transform to world frame.")
-                else:
-                    print("  Gemini found no point at pick pixel.")
-    finally:
-        pipeline.stop()
-        cv2.destroyAllWindows()
+        _step_pause("EE_LIFT_LADLE", f"Lift to {lift_w().tolist()}.", args)
+        publish(lift_w(), R_grasp, closed)
 
-    return ladle_xyz, bowl_xyz
+        def orient_tick(t_elapsed: float) -> None:
+            alpha = min(1.0, t_elapsed / args.orient_dur)
+            publish(lift_w(), _slerp(R_grasp, R_mix, alpha), closed)
+
+        run_timed(
+            "EE_ORIENT_LADLE",
+            "SLERP grasp → mixing orientation.",
+            args.orient_dur,
+            orient_tick,
+        )
+
+        if not args.skip_base:
+            _step_pause(
+                "BASE_TO_BOWL",
+                f"Drive base to bowl {base_bowl_goal.tolist()}.",
+                args,
+            )
+            publish(lift_w(), R_mix, closed)
+            _publish_base_goal(redis_client, base_bowl_goal)
+            print(f"  → base goal: {base_bowl_goal.tolist()}", flush=True)
+
+        _step_pause("EE_ABOVE_BOWL", f"Move above bowl {above_bowl_pos.tolist()}.", args)
+        publish(above_bowl_pos, R_mix, closed)
+
+        _step_pause("EE_LOWER_INTO_BOWL", f"Lower to mix height {at_bowl_pos.tolist()}.", args)
+        publish(at_bowl_pos, R_mix, closed)
+
+        def mix_tick(t_elapsed: float) -> None:
+            ee_goal = np.array([
+                bowl_cx + args.mix_radius * math.cos(args.mix_omega * t_elapsed),
+                bowl_cy + args.mix_radius * math.sin(args.mix_omega * t_elapsed),
+                z_mix_ee,
+            ])
+            publish(ee_goal, R_mix, closed)
+
+        run_timed(
+            "EE_MIX",
+            f"Stir bowl (r={args.mix_radius}, ω={args.mix_omega}).",
+            args.mix_dur,
+            mix_tick,
+        )
+
+        _step_pause("EE_LIFT_FROM_BOWL", f"Lift to {above_bowl_pos.tolist()}.", args)
+        publish(above_bowl_pos, R_mix, closed)
+
+        if not args.skip_base:
+            _step_pause(
+                "BASE_TO_LADLE_REST",
+                f"Drive base back to ladle {base_ladle_goal.tolist()}.",
+                args,
+            )
+            publish(above_bowl_pos, R_mix, closed)
+            _publish_base_goal(redis_client, base_ladle_goal)
+            print(f"  → base goal: {base_ladle_goal.tolist()}", flush=True)
+
+        def place_orient_tick(t_elapsed: float) -> None:
+            alpha = min(1.0, t_elapsed / args.orient_dur)
+            publish(hover_w(), _slerp(R_mix, R_grasp, alpha), closed)
+
+        run_timed(
+            "EE_PLACE_LADLE — hover + SLERP",
+            "Return to hover pose and grasp orientation.",
+            args.orient_dur,
+            place_orient_tick,
+        )
+
+        _step_pause("EE_PLACE_LADLE — descend", "Lower to ladle rest height.", args)
+        publish(grasp_w(), R_grasp, closed)
+
+        _step_pause("EE_PLACE_LADLE — open", "Open gripper to release ladle.", args)
+        publish(grasp_w(), R_grasp, opened)
+        time.sleep(_GRIPPER_SETTLE_S)
+
+        print("\n>>> DONE — ladle released, task complete.")
+        return 0
+
+    except _StepAbort:
+        print("\nStopped by user.")
+        return 0
+    except KeyboardInterrupt:
+        print("\nInterrupted — holding last goal.")
+        return 0
 
 
 # ── Autonomous FSM ─────────────────────────────────────────────────────────────
 def _run_fsm(redis_client, args,
              ladle_pos: np.ndarray,
              bowl_pos: np.ndarray) -> int:
+    if not args.auto:
+        return _run_fsm_manual(redis_client, args, ladle_pos, bowl_pos)
     # Derived geometry.
     ladle_grasp_offset = np.array(args.ladle_offset, dtype=np.float64)
     bowl_cx, bowl_cy, bowl_cz = bowl_pos
@@ -538,20 +614,6 @@ def _run_fsm(redis_client, args,
 
     base_ladle_goal = np.array(args.base_ladle, dtype=np.float64)
     base_bowl_goal  = np.array(args.base_bowl,  dtype=np.float64)
-
-    # ── Relative-base mode: resolve base offsets to absolute odometry coords ──
-    if args.relative_base:
-        base_now = _read_base_pose(redis_client)
-        if base_now is None:
-            print("--relative-base: hb1::current_pose not in Redis. Aborting.")
-            return 1
-        print(f"\n[relative-base mode] base origin: {base_now.tolist()}")
-        base_ladle_goal = base_now + base_ladle_goal
-        base_ladle_goal[2] = _wrap_angle(base_ladle_goal[2])
-        base_bowl_goal  = base_now + base_bowl_goal
-        base_bowl_goal[2] = _wrap_angle(base_bowl_goal[2])
-        print(f"  --base-ladle resolved → {base_ladle_goal.tolist()}")
-        print(f"  --base-bowl  resolved → {base_bowl_goal.tolist()}")
 
     R_grasp = _link7_orientation_world(0.0, 0.0, 45.0)
     R_mix   = _ladle_mixing_orientation()
@@ -577,7 +639,7 @@ def _run_fsm(redis_client, args,
     above_bowl_pos = np.array([bowl_cx, bowl_cy, z_above_bowl])
     at_bowl_pos    = np.array([bowl_cx, bowl_cy, z_mix_ee])
 
-    print("\n=== Mixing Full Controller ===")
+    print("\n=== Mixing Controller (--auto) ===")
     print(f"  ladle pos    : {ladle_pos.tolist()}")
     print(f"  bowl pos     : {bowl_pos.tolist()}")
     print(f"  grasp target : {ladle_grasp_world().tolist()}")
@@ -606,30 +668,10 @@ def _run_fsm(redis_client, args,
     hold_ee_pos: np.ndarray | None = None
     hold_ee_ori: np.ndarray | None = None
 
-    calib_log: dict[str, list[float]] = {}
-
-    pending_next = None  # _State | None — set when --step is waiting for Enter
-
-    def goto(next_st: _State) -> None:
-        nonlocal state, pending_next
-        if not args.no_step:
-            if pending_next is not next_st:
-                pending_next = next_st
-                print(f"\n  [step] {state.value} complete "
-                      f"— press Enter to continue → {next_st.value}")
-        else:
-            state = next_st
-
-    _stdin_attrs = _setup_cbreak()
-    hints = ["'p' = print EE status"]
-    if not args.no_step:
-        hints.append("Enter = advance to next state")
-    print(f"  [{' | '.join(hints)}]")
-
     try:
         while state != _State.DONE:
             now  = time.perf_counter()
-            pose = vc.read_current_ee_world(redis_client)
+            pose = read_current_ee_world(redis_client)
             cur_pos = pose[0] if pose is not None else None
             cur_ori = pose[1] if pose is not None else None
             base    = _read_base_pose(redis_client)
@@ -656,7 +698,6 @@ def _run_fsm(redis_client, args,
                     _set_gripper(redis_client, open_w, spd, frc)
                     print(f"  hover target: {hover_w.tolist()}")
                     print(f"  EE now      : {cur_pos.tolist() if cur_pos is not None else 'unknown'}")
-                    _log_calib_snapshot(redis_client, "near_ladle", calib_log, cur_pos, base)
 
                 elif state == _State.EE_GRASP_LADLE:
                     grasp_phase = 0
@@ -669,19 +710,16 @@ def _run_fsm(redis_client, args,
                 elif state == _State.EE_ORIENT_LADLE:
                     orient_t0 = now
                     print(f"  SLERP R_grasp → R_mix over {args.orient_dur:.1f} s")
-                    print(f"  pos         : {lift_w.tolist()} → {above_bowl_pos.tolist()}")
+                    print(f"  holding pos : {lift_w.tolist()}")
 
                 elif state == _State.BASE_TO_BOWL:
-                    # Hold wherever the arm actually is after ORIENT, not lift_w,
-                    # so there's no backwards goal jump after the SLERP interpolation.
-                    hold_ee_pos = cur_pos.copy() if cur_pos is not None else lift_w.copy()
+                    hold_ee_pos = lift_w.copy()
                     hold_ee_ori = R_mix.copy()
                     print(f"  base goal   : {base_bowl_goal.tolist()}")
                     print(f"  hold EE pos : {hold_ee_pos.tolist()}")
 
                 elif state == _State.EE_ABOVE_BOWL:
                     print(f"  bowl above  : {above_bowl_pos.tolist()}")
-                    _log_calib_snapshot(redis_client, "near_bowl", calib_log, cur_pos, base)
 
                 elif state == _State.EE_LOWER_INTO_BOWL:
                     print(f"  mix height  : {at_bowl_pos.tolist()}")
@@ -690,7 +728,6 @@ def _run_fsm(redis_client, args,
                     mix_t0 = last_mix_print = now
                     print(f"  Stirring for {args.mix_dur:.1f} s  "
                           f"(r={args.mix_radius} m, ω={args.mix_omega} rad/s)")
-                    _log_calib_snapshot(redis_client, "mix_height", calib_log, cur_pos, base)
 
                 elif state == _State.EE_LIFT_FROM_BOWL:
                     print(f"  lift to     : {above_bowl_pos.tolist()}")
@@ -706,7 +743,6 @@ def _run_fsm(redis_client, args,
                     orient_t0   = now
                     print(f"  3-phase sub-FSM: hover+SLERP → descend → open")
                     print(f"  hover target: {hover_w.tolist()}")
-                    _log_calib_snapshot(redis_client, "return_ladle", calib_log, cur_pos, base)
 
                 prev_state = state
 
@@ -718,15 +754,15 @@ def _run_fsm(redis_client, args,
                     _publish_base_goal(redis_client, base_ladle_goal)
                     if _base_converged(base, base_ladle_goal,
                                        args.base_xy_tol, args.base_yaw_tol):
-                        goto(_State.EE_ABOVE_LADLE)
+                        state = _State.EE_ABOVE_LADLE
                 else:
-                    goto(_State.EE_ABOVE_LADLE)
+                    state = _State.EE_ABOVE_LADLE
 
             elif state == _State.EE_ABOVE_LADLE:
                 _publish_cartesian(redis_client, hover_w, R_grasp)
                 _set_gripper(redis_client, open_w, spd, frc)
                 if _ee_converged(cur_pos, hover_w, args.ee_pos_tol):
-                    goto(_State.EE_GRASP_LADLE)
+                    state = _State.EE_GRASP_LADLE
 
             elif state == _State.EE_GRASP_LADLE:
                 # Phase 0: descend to grasp.
@@ -767,25 +803,21 @@ def _run_fsm(redis_client, args,
                     if now - phase_t0 >= args.grasp_close_dwell:
                         ladle_pos_locked = True
                         print(f"  [grasp ph3 → LIFT]  Ladle locked at {ladle_pos.tolist()}")
-                        goto(_State.EE_LIFT_LADLE)
+                        state = _State.EE_LIFT_LADLE
 
             elif state == _State.EE_LIFT_LADLE:
                 _publish_cartesian(redis_client, lift_w, R_grasp)
                 _set_gripper(redis_client, close_w, spd, frc)
                 if _ee_converged(cur_pos, lift_w, args.ee_pos_tol):
-                    goto(_State.EE_ORIENT_LADLE)
+                    state = _State.EE_ORIENT_LADLE
 
             elif state == _State.EE_ORIENT_LADLE:
-                alpha     = (now - orient_t0) / args.orient_dur
-                a_clamped = min(1.0, max(0.0, alpha))
-                R_interp  = _slerp(R_grasp, R_mix, a_clamped)
-                # Move toward above_bowl_pos while rotating to avoid rotating in
-                # place at a kinematically poor configuration.
-                pos_interp = lift_w + a_clamped * (above_bowl_pos - lift_w)
-                _publish_cartesian(redis_client, pos_interp, R_interp)
+                alpha    = (now - orient_t0) / args.orient_dur
+                R_interp = _slerp(R_grasp, R_mix, alpha)
+                _publish_cartesian(redis_client, lift_w, R_interp)
                 _set_gripper(redis_client, close_w, spd, frc)
                 if alpha >= 1.0:
-                    goto(_State.BASE_TO_BOWL)
+                    state = _State.BASE_TO_BOWL
 
             elif state == _State.BASE_TO_BOWL:
                 _publish_cartesian(redis_client, hold_ee_pos, hold_ee_ori)
@@ -794,21 +826,21 @@ def _run_fsm(redis_client, args,
                     _publish_base_goal(redis_client, base_bowl_goal)
                     if _base_converged(base, base_bowl_goal,
                                        args.base_xy_tol, args.base_yaw_tol):
-                        goto(_State.EE_ABOVE_BOWL)
+                        state = _State.EE_ABOVE_BOWL
                 else:
-                    goto(_State.EE_ABOVE_BOWL)
+                    state = _State.EE_ABOVE_BOWL
 
             elif state == _State.EE_ABOVE_BOWL:
                 _publish_cartesian(redis_client, above_bowl_pos, R_mix)
                 _set_gripper(redis_client, close_w, spd, frc)
                 if _ee_converged(cur_pos, above_bowl_pos, args.ee_pos_tol):
-                    goto(_State.EE_LOWER_INTO_BOWL)
+                    state = _State.EE_LOWER_INTO_BOWL
 
             elif state == _State.EE_LOWER_INTO_BOWL:
                 _publish_cartesian(redis_client, at_bowl_pos, R_mix)
                 _set_gripper(redis_client, close_w, spd, frc)
                 if _ee_converged(cur_pos, at_bowl_pos, args.ee_pos_tol):
-                    goto(_State.EE_MIX)
+                    state = _State.EE_MIX
 
             elif state == _State.EE_MIX:
                 t = now - mix_t0
@@ -824,13 +856,13 @@ def _run_fsm(redis_client, args,
                     print(f"  MIX {t:5.1f} / {args.mix_dur:.1f} s{pos_str}")
                     last_mix_print = now
                 if t >= args.mix_dur:
-                    goto(_State.EE_LIFT_FROM_BOWL)
+                    state = _State.EE_LIFT_FROM_BOWL
 
             elif state == _State.EE_LIFT_FROM_BOWL:
                 _publish_cartesian(redis_client, above_bowl_pos, R_mix)
                 _set_gripper(redis_client, close_w, spd, frc)
                 if _ee_converged(cur_pos, above_bowl_pos, args.ee_pos_tol):
-                    goto(_State.BASE_TO_LADLE_REST)
+                    state = _State.BASE_TO_LADLE_REST
 
             elif state == _State.BASE_TO_LADLE_REST:
                 _publish_cartesian(redis_client, hold_ee_pos, hold_ee_ori)
@@ -839,9 +871,9 @@ def _run_fsm(redis_client, args,
                     _publish_base_goal(redis_client, base_ladle_goal)
                     if _base_converged(base, base_ladle_goal,
                                        args.base_xy_tol, args.base_yaw_tol):
-                        goto(_State.EE_PLACE_LADLE)
+                        state = _State.EE_PLACE_LADLE
                 else:
-                    goto(_State.EE_PLACE_LADLE)
+                    state = _State.EE_PLACE_LADLE
 
             elif state == _State.EE_PLACE_LADLE:
                 # Phase 0: hover at ladle_hover_world while SLERPing back to R_grasp.
@@ -872,52 +904,47 @@ def _run_fsm(redis_client, args,
                     _set_gripper(redis_client, open_w, spd, frc)
                     if _gripper_converged(redis_client, open_w, args.gripper_tol) or \
                             (now - gripper_cmd_t0 >= _GRIPPER_SETTLE_S):
-                        goto(_State.DONE)
+                        state = _State.DONE
 
             time.sleep(dt)
 
-            key = _check_keypress()
-            if key in ('\r', '\n') and pending_next is not None:
-                state = pending_next
-                pending_next = None
-            elif key == 'p':
-                _print_ee_status(redis_client, state.value, cur_pos, base)
-
     except KeyboardInterrupt:
-        _restore_stdin(_stdin_attrs)
         print("\nInterrupted — holding last goal.")
-        _print_calib_summary_full(
-            calib_log, ladle_pos, bowl_pos,
-            z_mix_ee, z_above_bowl,
-            base_ladle_goal, base_bowl_goal,
-        )
         return 0
 
-    _restore_stdin(_stdin_attrs)
     print("\n>>> DONE — ladle released, task complete.")
-    _print_calib_summary_full(
-        calib_log, ladle_pos, bowl_pos,
-        z_mix_ee, z_above_bowl,
-        base_ladle_goal, base_bowl_goal,
-    )
     return 0
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Mixing controller — full autonomous pipeline."
+        description="Mixing controller — step-by-step pipeline (Enter between steps)."
+    )
+    p.add_argument(
+        "--auto",
+        action="store_true",
+        help="Run without Enter pauses (same behavior as mixing_full_controller.py).",
+    )
+    p.add_argument(
+        "--pause-sec",
+        type=float,
+        default=0.0,
+        metavar="SEC",
+        help="Timed pause between steps instead of Enter (for non-interactive terminals).",
     )
 
-    # Object positions.
-    p.add_argument("--ladle-xyz", type=float, nargs=3, default=None,
+    # Object positions (fixed defaults; tune DEFAULT_* at top of file).
+    p.add_argument("--ladle-xyz", type=float, nargs=3,
+                   default=list(DEFAULT_LADLE_POSITION),
                    metavar=("X", "Y", "Z"),
-                   help="Ladle rest position in world frame (m). "
-                        "If omitted, use Gemini+RealSense detection.")
-    p.add_argument("--bowl-xyz", type=float, nargs=3, default=None,
+                   help=f"Ladle rest position in world frame (m). "
+                        f"Default: {DEFAULT_LADLE_POSITION}")
+    p.add_argument("--bowl-xyz", type=float, nargs=3,
+                   default=list(DEFAULT_BOWL_POSITION),
                    metavar=("X", "Y", "Z"),
-                   help="Bowl centre in world frame (m). "
-                        "If omitted, use Gemini+RealSense detection.")
+                   help=f"Bowl centre in world frame (m). "
+                        f"Default: {DEFAULT_BOWL_POSITION}")
 
     # Base navigation.
     p.add_argument("--base-ladle", type=float, nargs=3,
@@ -974,41 +1001,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--gripper-speed",       type=float, default=_GRIPPER_SPEED_DEFAULT)
     p.add_argument("--gripper-force",       type=float, default=_GRIPPER_FORCE_DEFAULT)
 
-    # Camera detection.
-    p.add_argument("--ee-from-cam-json", type=Path, default=None,
-                   help="4×4 T_ee_cam JSON. Uses built-in placeholder if omitted.")
-    p.add_argument("--model",       default=None)   # filled from gp.DEFAULT_MODEL if needed
-    p.add_argument("--temperature", type=float, default=0.5)
-    p.add_argument("--cam-width",   type=int, default=_CAM_WIDTH_DEFAULT)
-    p.add_argument("--cam-height",  type=int, default=_CAM_HEIGHT_DEFAULT)
-    p.add_argument("--cam-fps",     type=int, default=_CAM_FPS_DEFAULT)
-    p.add_argument("--cam-warmup",  type=int, default=_CAM_WARMUP_DEFAULT)
-    p.add_argument("--cam-timeout", type=int, default=_CAM_TIMEOUT_DEFAULT)
-
     p.add_argument("--redis-host", default="localhost")
     p.add_argument("--redis-port", type=int, default=6379)
-
-    p.add_argument(
-        "--relative", action="store_true",
-        help=(
-            "Interpret --ladle-xyz and --bowl-xyz as offsets from the arm's current "
-            "EE position at startup. Use (0 0 0) to reference the ladle from wherever "
-            "the arm currently is. Logs absolute coords at each key state for hardcoding."
-        ),
-    )
-    p.add_argument(
-        "--relative-base", action="store_true",
-        help=(
-            "Interpret --base-ladle and --base-bowl as offsets from the current "
-            "hb1 odometry pose at startup (dx, dy, dyaw). Combine with --relative to "
-            "test the full pipeline without knowing any absolute coordinates."
-        ),
-    )
-    p.add_argument(
-        "--no-step", action="store_true",
-        help="Run continuously without pausing between states. "
-             "Default behaviour is to pause after each state and wait for Enter.",
-    )
 
     return p.parse_args()
 
@@ -1017,60 +1011,20 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
 
-    # Resolve camera model default lazily so the import only runs if needed.
-    if args.model is None:
-        try:
-            from vision import gemini_pointing as _gp
-            args.model = _gp.DEFAULT_MODEL
-        except ImportError:
-            args.model = "gemini-1.5-pro"
-
-    redis_client = vc._try_redis(args.redis_host, args.redis_port)
+    redis_client = _try_redis(args.redis_host, args.redis_port)
     if redis_client is None:
         return 1
-    err = vc.validate_config(redis_client)
+    err = validate_config(redis_client)
     if err is not None:
         return err
 
-    ladle_xyz = (np.array(args.ladle_xyz, dtype=np.float64)
-                 if args.ladle_xyz is not None else None)
-    bowl_xyz  = (np.array(args.bowl_xyz,  dtype=np.float64)
-                 if args.bowl_xyz  is not None else None)
+    ladle_pos = np.array(args.ladle_xyz, dtype=np.float64).reshape(3)
+    bowl_pos = np.array(args.bowl_xyz, dtype=np.float64).reshape(3)
 
-    # ── Relative mode: resolve EE offsets to absolute world coordinates ────────
-    if args.relative and (ladle_xyz is not None or bowl_xyz is not None):
-        pose = vc.read_current_ee_world(redis_client)
-        if pose is None:
-            print("--relative: cannot read current EE pose from Redis. Aborting.",
-                  file=sys.stderr)
-            return 1
-        ee_origin = pose[0]
-        print(f"\n[relative mode] EE origin at startup: {ee_origin.tolist()}")
-        if ladle_xyz is not None:
-            ladle_xyz = ee_origin + ladle_xyz
-            print(f"  --ladle-xyz resolved → {ladle_xyz.tolist()}")
-        if bowl_xyz is not None:
-            bowl_xyz = ee_origin + bowl_xyz
-            print(f"  --bowl-xyz  resolved → {bowl_xyz.tolist()}")
+    print(f"Using ladle position: {ladle_pos.tolist()}")
+    print(f"Using bowl position:  {bowl_pos.tolist()}")
 
-    need_ladle = ladle_xyz is None
-    need_bowl  = bowl_xyz  is None
-
-    if need_ladle or need_bowl:
-        detected_ladle, detected_bowl = _detect_objects(
-            redis_client, args, need_ladle, need_bowl)
-        if need_ladle:
-            if detected_ladle is None:
-                print("Ladle position not obtained. Aborting.", file=sys.stderr)
-                return 1
-            ladle_xyz = detected_ladle
-        if need_bowl:
-            if detected_bowl is None:
-                print("Bowl position not obtained. Aborting.", file=sys.stderr)
-                return 1
-            bowl_xyz = detected_bowl
-
-    return _run_fsm(redis_client, args, ladle_xyz, bowl_xyz)
+    return _run_fsm(redis_client, args, ladle_pos, bowl_pos)
 
 
 if __name__ == "__main__":
