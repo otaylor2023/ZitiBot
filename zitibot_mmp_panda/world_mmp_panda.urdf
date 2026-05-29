@@ -218,16 +218,6 @@
 	        </geometry>
 	    </visual>
 
-		<visual>
-	        <origin xyz="0 0 0.06" rpy="0 0 0" />
-	        <geometry>
-	            <box size="0.1 0.1 0.15" />
-	        </geometry>
-	        <material name="material">
-		        <color rgba="1 1 1 1.0" />
-	        </material>
-	    </visual>
-
 	    <collision>
 	        <origin xyz="0 0 0.06" rpy="0 0 0" />
 	        <geometry>

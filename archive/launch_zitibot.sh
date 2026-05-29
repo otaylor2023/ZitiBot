@@ -5,15 +5,18 @@ set -euo pipefail
 
 WAIT_FOR_SPACE=false
 RUN_BUILD=false
+TOUCH_DEMO=false
 for arg in "$@"; do
 	case "${arg}" in
 		--wait) WAIT_FOR_SPACE=true ;;
 		--build) RUN_BUILD=true ;;
+		--touch) TOUCH_DEMO=true ;;
 		-h | --help)
-			echo "Usage: $(basename "$0") [--wait] [--build]"
+			echo "Usage: $(basename "$0") [--wait] [--build] [--touch]"
 			echo "  default   visualizer, countdown, controller (no build)"
 			echo "  --wait    wait for SPACE in this terminal before starting the controller"
 			echo "  --build   run CMake configure + build for ZitiBot targets, then launch"
+			echo "  --touch   run controller_touch (hardware Redis keys only; not simviz keys)"
 			echo "Env: JOBS, CMAKE_BUILD_TYPE (same as build_zitibot.sh)"
 			echo "Redis must already be running."
 			exit 0
@@ -30,6 +33,7 @@ BUILD_DIR="${SCRIPT_DIR}/build"
 BIN_DIR="${SCRIPT_DIR}/bin/zitibot_mmp_example"
 SIMVIZ="${BIN_DIR}/simviz_zitibot_mmp_panda"
 CTRL="${BIN_DIR}/controller_zitibot_mmp_panda"
+CTRL_TOUCH="${BIN_DIR}/controller_touch_zitibot_mmp_panda"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 
@@ -38,10 +42,15 @@ if [[ "${RUN_BUILD}" == true ]]; then
 	echo "==> Configuring (${BUILD_DIR})"
 	cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
 	echo "==> Building ZitiBot targets (${JOBS} jobs)"
-	cmake --build "${BUILD_DIR}" -j "${JOBS}" --target controller_zitibot_mmp_panda simviz_zitibot_mmp_panda
+	cmake --build "${BUILD_DIR}" -j "${JOBS}" --target controller_zitibot_mmp_panda controller_touch_zitibot_mmp_panda simviz_zitibot_mmp_panda
 fi
 
-for exe in "${SIMVIZ}" "${CTRL}"; do
+CTRL_EXE="${CTRL}"
+if [[ "${TOUCH_DEMO}" == true ]]; then
+	CTRL_EXE="${CTRL_TOUCH}"
+fi
+
+for exe in "${SIMVIZ}" "${CTRL_EXE}"; do
 	if [[ ! -x "${exe}" ]]; then
 		echo "Missing executable: ${exe}" >&2
 		echo "Run: ${SCRIPT_DIR}/build_zitibot.sh   or   ${SCRIPT_DIR}/launch_zitibot.sh --build" >&2
@@ -118,7 +127,13 @@ else
 fi
 
 echo "Starting controller (Ctrl+C or 'q' here stops both; Q in sim window also exits)..."
-"${CTRL}" &
+	if [[ "${TOUCH_DEMO}" == true ]]; then
+		echo "(controller_touch_zitibot_mmp_panda — hardware Redis keys only; not simviz keys)"
+		echo "Simviz alone publishes sim keys; use a robot/bridge Redis or do not use --touch here."
+		"${CTRL_TOUCH}" &
+else
+	"${CTRL}" &
+fi
 CTRL_PID=$!
 
 # Exit when either process dies (e.g. Q in sim closes visualizer → we stop controller and the script ends).

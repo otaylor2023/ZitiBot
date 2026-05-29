@@ -16,7 +16,7 @@ if [[ "${1:-}" == "--all" ]]; then
 	cmake --build "${BUILD_DIR}" -j "${JOBS}"
 else
 	echo "==> Building ZitiBot MMP targets (${JOBS} jobs)"
-	cmake --build "${BUILD_DIR}" -j "${JOBS}" --target controller_zitibot_mmp_panda simviz_zitibot_mmp_panda
+	cmake --build "${BUILD_DIR}" -j "${JOBS}" --target controller_zitibot_mmp_panda controller_touch_zitibot_mmp_panda simviz_zitibot_mmp_panda
 fi
 
 BIN="${SCRIPT_DIR}/bin/zitibot_mmp_example"
@@ -24,3 +24,4 @@ echo ""
 echo "Done. Binaries:"
 echo "  ${BIN}/simviz_zitibot_mmp_panda"
 echo "  ${BIN}/controller_zitibot_mmp_panda"
+echo "  ${BIN}/controller_touch_zitibot_mmp_panda"
