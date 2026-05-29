@@ -226,6 +226,54 @@
 	    </collision>
 	</dynamic_object>
 
+	<dynamic_object name="ladle">
+		<!-- Resting on the island surface (island top z ≈ 0.9144) -->
+		<origin xyz="0.5 0.9 0.5827" rpy="0 0 0" />
+		<inertial>
+			<!-- CoM and inertia computed from actual mesh geometry at 0.3 kg -->
+			<origin xyz="0.11176 0.02270 0.03876" rpy="0 0 0" />
+			<mass value="0.3" />
+			<inertia ixx="0.000182" iyy="0.002030" izz="0.002067" ixy="-0.000404" ixz="0.0" iyz="0.0" />
+		</inertial>
+		<visual>
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<geometry>
+				<mesh filename="${CS225A_URDF_FOLDER}/test_objects/meshes/visual/ladle.obj" />
+			</geometry>
+		</visual>
+		<collision>
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<geometry>
+				<mesh filename="${CS225A_URDF_FOLDER}/test_objects/meshes/collision/ladle_collision.obj" />
+			</geometry>
+		</collision>
+	</dynamic_object>
+
+	<dynamic_object name="tray">
+    	<!-- Resting on the island surface next to cup and ladle (island top z ≈ 0.5644) -->
+    	<origin xyz="0.1 0.55 0.6" rpy="0 0 0" />
+    	<inertial>
+        	<origin xyz="0 0 0" rpy="0 0 0" />
+        	<mass value="0.8" />
+        	<inertia ixx="0.005" iyy="0.009" izz="0.013" ixy="0" ixz="0" iyz="0" />
+    	</inertial>
+    	<visual>
+        	<origin xyz="0 0 0" rpy="1.5708 0 0" />
+        	<geometry>
+            	<mesh filename="${CS225A_URDF_FOLDER}/test_objects/meshes/visual/tray.obj" scale="0.01 0.01 0.01" />
+       	 	</geometry>
+        	<material name="tray_silver">
+        		<color rgba="0.7 0.7 0.75 1.0" />
+        	</material>
+    	</visual>
+    	<collision>
+        	<origin xyz="0.2286 0.1524 0.03175" rpy="1.5708 0 0" />
+        	<geometry>
+            	<box size="0.508 0.3048 0.0635" />
+        	</geometry>
+    	</collision>
+	</dynamic_object>
+
 	<dynamic_object name="empty_bowl">
 		<origin xyz="0.15 0.60 0.88" rpy="1.5707963267948966 0 0" />
 		<inertial>
@@ -245,16 +293,6 @@
 				<mesh filename="${CS225A_URDF_FOLDER}/test_objects/meshes/visual/EmptyBowl.obj" />
 			</geometry>
 		</collision>
-		<!-- Same transform/geometry as collision; semi-transparent so physics hull is visible in viz. -->
-		<visual name="collision_debug">
-			<origin xyz="0 0 0" rpy="0 0 0" />
-			<geometry>
-				<mesh filename="${CS225A_URDF_FOLDER}/test_objects/meshes/visual/EmptyBowl.obj" scale="1.002 1.002 1.002" />
-			</geometry>
-			<material name="bowl_coll_debug">
-				<color rgba="0.2 0.95 0.25 0.35" />
-			</material>
-		</visual>
 	</dynamic_object>
 
 	<light name="light1" type="directional">
