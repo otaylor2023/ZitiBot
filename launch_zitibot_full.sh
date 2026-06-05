@@ -27,7 +27,16 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_XML="config_folder/xml_config_files/zitibot_panda.xml"
 LAUNCH_SH="${REPO_ROOT}/scripts/launch.sh"
 OPENSAI_MAIN="${REPO_ROOT}/bin/OpenSai_main"
-PYTHON="${PYTHON:-python3}"
+if [[ -z "${PYTHON:-}" ]]; then
+	# The base Redis driver needs hardware packages (phoenix6, ruckig) that
+	# are installed in the project conda env, not the default base env.
+	ZITIBOT_PYTHON="${HOME}/miniforge3/envs/zitibot/bin/python"
+	if [[ -x "${ZITIBOT_PYTHON}" ]]; then
+		PYTHON="${ZITIBOT_PYTHON}"
+	else
+		PYTHON="python3"
+	fi
+fi
 
 GRIPPER_DIR="${REPO_ROOT}/drivers/FrankaPanda/redis_driver"
 GRIPPER_BIN="${GRIPPER_DIR}/build/sai_franka_gripper_redis_driver"
@@ -41,8 +50,8 @@ READY_TIMEOUT_SEC=90
 DRIVER_STARTUP_SEC=3
 DRIVER_READY_TIMEOUT_SEC=15
 
-MAX_VEL_XY="${MAX_VEL_XY:-0.25}"
-MAX_VEL_YAW="${MAX_VEL_YAW:-0.79}"
+MAX_VEL_XY="${MAX_VEL_XY:-0.125}"
+MAX_VEL_YAW="${MAX_VEL_YAW:-0.4}"
 MAX_ACCEL_XY="${MAX_ACCEL_XY:-0.1}"
 MAX_ACCEL_YAW="${MAX_ACCEL_YAW:-0.5}"
 

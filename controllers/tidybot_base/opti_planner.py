@@ -33,13 +33,12 @@ from tidybot_base.se2 import (
 # Yaw commands do NOT need this offset — when both the start and target yaw
 # are in the marker frame, the offset cancels in the delta.
 #
-# Locked-in default ``+41.0 deg`` matches the current ``tidybot01`` rigid body
-# (settled around +41 deg empirically on 2026-05-28 — see the live
-# ``marker_offset_est_deg`` line in ``opti_nav.print_pose_log_block`` to
-# re-tune if you re-create the rigid body in Motive). Override via
+# Locked-in default ``+140.14 deg`` matches the current ``tidybot01`` rigid body
+# (estimated by ``tune_marker_offset.py`` on 2026-05-29 — re-tune if you
+# re-create the rigid body in Motive). Override via
 # ``--marker-yaw-offset-deg`` on ``opti_controller``, or by passing a
 # ``NavConfig(marker_yaw_offset_deg=...)`` to ``opti_nav``.
-DEFAULT_MARKER_YAW_OFFSET_DEG = 41.0
+DEFAULT_MARKER_YAW_OFFSET_DEG = 40.50
 
 # Legacy alias kept for backwards-compat with prior code/CLI.
 ROBOT_FRAME_ROT_DEG = DEFAULT_MARKER_YAW_OFFSET_DEG
@@ -81,6 +80,17 @@ class MocapToHbCalib:
     trans: np.ndarray  # length 2
     mocap_rot: np.ndarray  # 2×2 horizontal rotation from mocap quaternion
     mocap_start_yaw: float
+
+
+@dataclass
+class MotionCalibEstimate:
+    """Live Opti-world → hb-odom direction estimate from observed translation."""
+
+    rot: np.ndarray
+    yaw_rad: float
+    hb_motion_m: float
+    opti_motion_m: float
+    sample_count: int
 
 
 @dataclass
@@ -180,12 +190,85 @@ def mocap_pose_to_hb_se2(
     return np.array([hb_xy[0], hb_xy[1], hb_yaw_hold], dtype=np.float64)
 
 
+class MotionDirectionEstimator:
+    """Estimate Opti-world → hb-odom rotation from matching displacement pairs.
+
+    This removes the steady-state dependence on Motive's arbitrary rigid-body
+    marker axes. The first few centimeters still use the seeded rotation, then
+    observed hb/Opti motion updates the rotation used by the replanner.
+    """
+
+    def __init__(
+        self,
+        *,
+        seed_rot: np.ndarray,
+        seed_robot_xyyaw: np.ndarray,
+        seed_mocap_xyz: np.ndarray,
+        min_motion_m: float = 0.08,
+        max_yaw_change_rad: float = math.radians(8.0),
+    ) -> None:
+        self._seed_rot = np.asarray(seed_rot, dtype=np.float64).reshape(2, 2)
+        self._anchor_robot = np.asarray(seed_robot_xyyaw, dtype=np.float64).reshape(3).copy()
+        self._anchor_mocap_xy = xy2(seed_mocap_xyz).copy()
+        self._min_motion_m = float(min_motion_m)
+        self._max_yaw_change_rad = float(max_yaw_change_rad)
+        self._estimate: MotionCalibEstimate | None = None
+
+    @property
+    def estimate(self) -> MotionCalibEstimate | None:
+        return self._estimate
+
+    @property
+    def rot(self) -> np.ndarray:
+        if self._estimate is None:
+            return self._seed_rot
+        return self._estimate.rot
+
+    def reset_anchor(self, robot_xyyaw: np.ndarray, mocap_xyz: np.ndarray) -> None:
+        """Start a new straight-translation observation window."""
+        self._anchor_robot = np.asarray(robot_xyyaw, dtype=np.float64).reshape(3).copy()
+        self._anchor_mocap_xy = xy2(mocap_xyz).copy()
+        self._estimate = None
+
+    def update(
+        self,
+        robot_xyyaw: np.ndarray,
+        mocap_xyz: np.ndarray,
+    ) -> MotionCalibEstimate | None:
+        """Update from current hb/Opti displacement; return estimate if valid."""
+        robot = np.asarray(robot_xyyaw, dtype=np.float64).reshape(3)
+        yaw_delta = abs(wrap_angle(float(robot[2]) - float(self._anchor_robot[2])))
+        if yaw_delta > self._max_yaw_change_rad:
+            return None
+
+        hb_delta = xy2(robot) - xy2(self._anchor_robot)
+        opti_delta = xy2(mocap_xyz) - self._anchor_mocap_xy
+        hb_norm = float(np.linalg.norm(hb_delta))
+        opti_norm = float(np.linalg.norm(opti_delta))
+        if hb_norm < self._min_motion_m or opti_norm < self._min_motion_m:
+            return None
+
+        yaw = wrap_angle(
+            math.atan2(float(hb_delta[1]), float(hb_delta[0]))
+            - math.atan2(float(opti_delta[1]), float(opti_delta[0]))
+        )
+        self._estimate = MotionCalibEstimate(
+            rot=rot2d_from_yaw(yaw),
+            yaw_rad=yaw,
+            hb_motion_m=hb_norm,
+            opti_motion_m=opti_norm,
+            sample_count=1,
+        )
+        return self._estimate
+
+
 def replan_hb_goal_from_opti(
     plan: "RunPlan",
     waypoint_idx: int,
     mocap_xyz: np.ndarray,
     mocap_quat: np.ndarray,
     robot_current: np.ndarray,
+    opti_to_hb_rot: np.ndarray | None = None,
 ) -> np.ndarray:
     """Live-corrected hb goal: closes the current Opti-world error in hb frame.
 
@@ -197,24 +280,32 @@ def replan_hb_goal_from_opti(
     base controller drives hb to that updated goal; as the Opti error
     shrinks the goal converges, and any drift gets continuously nudged out.
 
-    XY:  ``hb_current + calib.rot @ (opti_target_xy − opti_current_xy)``.
-    Yaw: at the final waypoint with ``require_final_yaw``, command
-         ``hb_current_yaw + (target_marker_yaw − marker_yaw_now)`` (the body
-         and marker rotate together, so the marker-yaw delta is the hb-yaw
-         delta). Otherwise hold the startup hb yaw (translation phase, or
-         no-yaw straight-line).
+    XY:  ``hb_current + R @ (opti_target_xy − opti_current_xy)`` where
+         ``R`` is either the startup calibration or a live motion estimate.
+    Yaw: at the final waypoint with ``require_final_yaw``, use the same
+         Opti→hb direction estimate when available; otherwise fall back to
+         marker-yaw delta. Translation-only phases hold startup hb yaw.
     """
     is_final_waypoint = waypoint_idx >= len(plan.hb_waypoints) - 1
     opti_target_xy = xy2(plan.desired_mocap_xyz)
     opti_err_xy = opti_target_xy - xy2(mocap_xyz)
-    hb_xy = xy2(robot_current) + plan.calib.rot @ opti_err_xy
+    rot = plan.calib.rot if opti_to_hb_rot is None else opti_to_hb_rot
+    hb_xy = xy2(robot_current) + rot @ opti_err_xy
 
     if is_final_waypoint and plan.require_final_yaw:
-        marker_yaw_now = quat_xyzw_to_yaw(mocap_quat)
-        hb_yaw = wrap_angle(
-            float(robot_current[2])
-            + wrap_angle(plan.desired_mocap_yaw - marker_yaw_now)
-        )
+        if opti_to_hb_rot is not None:
+            rot_yaw = rot2d_yaw(opti_to_hb_rot)
+            body_yaw_now = wrap_angle(float(robot_current[2]) - rot_yaw)
+            hb_yaw = wrap_angle(
+                float(robot_current[2])
+                + wrap_angle(plan.desired_body_yaw_in_opti - body_yaw_now)
+            )
+        else:
+            marker_yaw_now = quat_xyzw_to_yaw(mocap_quat)
+            hb_yaw = wrap_angle(
+                float(robot_current[2])
+                + wrap_angle(plan.desired_mocap_yaw - marker_yaw_now)
+            )
     else:
         hb_yaw = float(plan.robot_start[2])
 
@@ -230,6 +321,17 @@ def opti_body_yaw_error_rad(plan: "RunPlan", mocap_quat: np.ndarray) -> float:
     """Absolute body-yaw error in Opti world (|target − current|, wrapped)."""
     marker_yaw = quat_xyzw_to_yaw(mocap_quat)
     body_yaw = wrap_angle(marker_yaw - math.radians(plan.marker_yaw_offset_deg))
+    return abs(wrap_angle(plan.desired_body_yaw_in_opti - body_yaw))
+
+
+def opti_body_yaw_error_from_motion_calib_rad(
+    plan: "RunPlan",
+    robot_current: np.ndarray,
+    opti_to_hb_rot: np.ndarray,
+) -> float:
+    """Body-yaw error in Opti world using hb yaw plus estimated frame rotation."""
+    rot_yaw = rot2d_yaw(opti_to_hb_rot)
+    body_yaw = wrap_angle(float(robot_current[2]) - rot_yaw)
     return abs(wrap_angle(plan.desired_body_yaw_in_opti - body_yaw))
 
 
@@ -279,6 +381,7 @@ def build_hb_waypoints(
     cardinal_hb: bool,
     direct_motion: bool = True,
     straight_line: bool = False,
+    rotate_first: bool = False,
 ) -> list[np.ndarray]:
     """Build hb1 desired_pose waypoints.
 
@@ -286,9 +389,17 @@ def build_hb_waypoints(
     no heading change (default for absolute position-only goals).
 
     ``direct_motion=True``: one holonomic goal ``[x, y, yaw]`` (XY + heading together).
+    Takes precedence over ``rotate_first``.
 
-    With ``direct_motion=False``: translate at start yaw, then rotate in place.
-    With ``cardinal_hb`` (and not direct): L-path in hb odom (X corner, then Y).
+    Default (no flags): translate at start yaw, then rotate in place at end.
+
+    ``rotate_first=True`` (and not ``direct_motion``/``straight_line``): rotate
+    in place at the start XY first, then translate at the final yaw. Useful
+    when the cart's driving direction matters for the translation phase
+    (e.g. you want to drive forward at the new heading).
+
+    With ``cardinal_hb`` (and not direct / not rotate_first): L-path in hb
+    odom (X corner, then Y).
     """
     final = np.asarray(robot_target, dtype=np.float64).reshape(3)
     hold_yaw = float(robot_start[2])
@@ -307,13 +418,21 @@ def build_hb_waypoints(
     if direct_motion:
         return [final]
 
+    if rotate_yaw and not translate_xy:
+        return [final]
+
+    if rotate_first and rotate_yaw and translate_xy:
+        rotate_wp = np.array(
+            [float(robot_start[0]), float(robot_start[1]), final_yaw],
+            dtype=np.float64,
+        )
+        return [rotate_wp, final]
+
     trans_xy = np.array([final[0], final[1], hold_yaw], dtype=np.float64)
     waypoints: list[np.ndarray] = []
     if cardinal_hb and abs(dx) > 1e-4 and abs(dy) > 1e-4:
         corner = np.array([final[0], robot_start[1], hold_yaw], dtype=np.float64)
         waypoints.append(corner)
-    if rotate_yaw and not translate_xy:
-        return [final]
     waypoints.append(trans_xy)
     if rotate_yaw:
         waypoints.append(final)
@@ -347,6 +466,7 @@ def setup_run_plan(
     calib_yaw_deg: float | None = None,
     cardinal_hb: bool = False,
     direct_motion: bool = False,
+    rotate_first: bool = False,
     marker_yaw_offset_deg: float = DEFAULT_MARKER_YAW_OFFSET_DEG,
     face_lab_yaw: str | None = None,
     robot_pose_key: str | None = None,
@@ -437,6 +557,7 @@ def setup_run_plan(
         cardinal_hb=cardinal_hb,
         direct_motion=direct_motion and not straight_line,
         straight_line=straight_line,
+        rotate_first=rotate_first and not straight_line,
     )
 
     # curr_minus_desired only affects mocap error logging, not hb target mapping

@@ -24,10 +24,17 @@ DEFAULT_MOCAP_KEYS = MocapRedisKeys()
 
 
 def parse_tracking_valid(raw: bytes | str | None) -> bool:
-    """Interpret Redis ``tracking_valid`` (true/1/yes/on)."""
+    """Interpret Redis ``tracking_valid`` (true/1/yes/on).
+
+    Accepts both ``decode_responses=True`` (str) and ``decode_responses=False``
+    (bytes) Redis clients. Decodes bytes first so ``b'1'`` is treated as
+    ``"1"`` instead of falling through to ``"b'1'"``.
+    """
     if raw is None:
         return False
-    s = str(raw).strip().lower()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    s = raw.strip().lower()
     if s in ("true", "1", "yes", "on"):
         return True
     if s in ("false", "0", "no", "off", ""):

@@ -19,6 +19,14 @@ class BaseRedisKeys:
     desired_pose: str = "hb1::desired_pose"
     stop: str = "hb1::stop"
     kill: str = "hb1::kill"
+    # Live scale on the driver's OTG max_velocity. Driver multiplies its
+    # configured CLI baseline ``(--max-vel-xy, --max-vel-xy, --max-vel-yaw)``
+    # by this scalar each control tick. Missing / invalid key = 1.0
+    # (driver default). Clamped to [0.1, 3.0] in the driver to guard
+    # against typos. Used by ``zitibot_core.base.go_to_pose`` to make
+    # the holonomic path drive faster than the three-phase path without
+    # restarting the driver.
+    max_vel_scale: str = "hb1::max_vel_scale"
 
 
 DEFAULT_BASE_KEYS = BaseRedisKeys()
@@ -89,3 +97,19 @@ def stop_base(
 ) -> None:
     """Tell redis_driver to decelerate and hold current pose."""
     client.set(key or keys.stop, "stop")
+
+
+def write_max_vel_scale(
+    client: redis.Redis,
+    scale: float,
+    *,
+    keys: BaseRedisKeys = DEFAULT_BASE_KEYS,
+) -> None:
+    """Set the driver's live OTG max_velocity multiplier.
+
+    Driver multiplies its CLI baseline by this scalar each control tick.
+    Defaults to 1.0 if the key is missing or unparseable. The driver
+    clamps to [0.1, 3.0] for safety; callers shouldn't rely on values
+    outside that range taking effect.
+    """
+    client.set(keys.max_vel_scale, f"{float(scale):.6f}")

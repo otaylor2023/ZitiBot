@@ -15,6 +15,14 @@ BASE_VEL_KEY = "hb1::current_vel"
 DESIRED_BASE_POSE_KEY = "hb1::desired_pose"
 STOP_BASE_KEY = "hb1::stop"
 KILL_BASE_KEY = "hb1::kill"
+# Live scalar that controllers (see ``zitibot_core.base.go_to_pose``)
+# write to bump or cut the OTG max_velocity without restarting this
+# driver. Clamped to [MAX_VEL_SCALE_MIN, MAX_VEL_SCALE_MAX] below.
+# Missing / unparseable key = 1.0 (use the CLI baseline as-is).
+MAX_VEL_SCALE_KEY = "hb1::max_vel_scale"
+MAX_VEL_SCALE_MIN = 0.1
+MAX_VEL_SCALE_MAX = 3.0
+MAX_VEL_SCALE_CHANGE_EPS = 1e-3
 
 """
     Functions to read and write from redis 
@@ -115,9 +123,42 @@ if __name__ == '__main__':
     # Logging
     prev_goal_pose = vehicle.x
 
+    # OTG max_velocity scaling — see MAX_VEL_SCALE_KEY above. Cache the
+    # last applied scale so we only mutate / log when it actually changes.
+    baseline_max_vel = np.array(vehicle.max_vel, dtype=np.float64).copy()
+    redis_client.set(MAX_VEL_SCALE_KEY, "1.0")
+    current_scale = 1.0
+    print(f"Vehicle max_vel scale: {current_scale:.3f} (baseline {baseline_max_vel.tolist()})")
+
+    def _read_max_vel_scale():
+        raw = redis_client.get(MAX_VEL_SCALE_KEY)
+        if raw is None:
+            return 1.0
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(val):
+            return None
+        return float(np.clip(val, MAX_VEL_SCALE_MIN, MAX_VEL_SCALE_MAX))
+
     # Main loop for reading and writing to redis
     try:
         while True:
+
+            # Apply any live max_vel rescale before consuming the next pose
+            # goal so the OTG sees the new limit on this tick. Mutating
+            # otg_inp.max_velocity in place is safe with Ruckig — limits
+            # are not copied back by ``otg_out.pass_to_input``.
+            new_scale = _read_max_vel_scale()
+            if new_scale is not None and abs(new_scale - current_scale) > MAX_VEL_SCALE_CHANGE_EPS:
+                scaled = baseline_max_vel * new_scale
+                vehicle.otg_inp.max_velocity = scaled
+                print(
+                    f"Vehicle max_vel scale: {current_scale:.3f} -> {new_scale:.3f} "
+                    f"=> max_velocity {scaled.tolist()}"
+                )
+                current_scale = new_scale
 
             # Read stop signal
             if str(redis_client.get(STOP_BASE_KEY)) == 'stop':

@@ -113,3 +113,35 @@ def next_rgbd_frame(
     depth_m = depth_u16.astype(np.float32) * depth_scale
     depth_vis = depth_uint16_to_colormap_bgr(depth_u16)
     return color_bgr, depth_m, depth_vis
+
+
+def next_rgb_frame(
+    pipeline,
+    timeout_ms: int,
+    miss_counter: list[int],
+    max_misses: int,
+) -> np.ndarray | None:
+    """Color BGR frame only.
+
+    This intentionally does not align/read/process depth. It is for RGB-only
+    visual servoing where depth noise should not enter the control loop.
+    """
+    ok, frames = pipeline.try_wait_for_frames(timeout_ms)
+    if not ok:
+        miss_counter[0] += 1
+        print(
+            f"Frame didn't arrive within {timeout_ms} ms "
+            f"(miss {miss_counter[0]}/{max_misses})."
+        )
+        if miss_counter[0] >= max_misses:
+            raise TimeoutError(
+                "Too many consecutive timeouts. Check USB 3 connection, "
+                "try a different port/cable, or lower --fps / --width / --height."
+            )
+        return None
+    miss_counter[0] = 0
+
+    color_frame = frames.get_color_frame()
+    if not color_frame:
+        return None
+    return np.array(color_frame.get_data(), copy=True)

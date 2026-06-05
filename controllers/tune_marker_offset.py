@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import redis
 
+from tidybot_base import opti_planner as _opti_planner_module
 from tidybot_base.mocap import (
     DEFAULT_MOCAP_KEYS,
     MocapRedisKeys,
@@ -33,6 +36,62 @@ from tidybot_base.redis_io import (
     write_desired_pose,
 )
 from tidybot_base.se2 import quat_xyzw_to_yaw, wrap_angle
+
+
+_OFFSET_ASSIGN_RE = re.compile(
+    r"^(?P<prefix>DEFAULT_MARKER_YAW_OFFSET_DEG\s*=\s*)"
+    r"(?P<value>[-+]?\d+(?:\.\d+)?)"
+    r"(?P<suffix>.*)$",
+    re.MULTILINE,
+)
+
+
+def bake_offset_into_source(new_deg: float) -> Path | None:
+    """Rewrite ``DEFAULT_MARKER_YAW_OFFSET_DEG`` in ``opti_planner.py`` in place.
+
+    Returns the path that was edited, or ``None`` if the assignment line
+    couldn't be located (in which case the call is a no-op and a warning
+    is printed). Preserves the exact line formatting around the value.
+    """
+    target_path = Path(_opti_planner_module.__file__).resolve()
+    try:
+        original = target_path.read_text()
+    except OSError as exc:
+        print(f"[bake] could not read {target_path}: {exc}", file=sys.stderr)
+        return None
+
+    new_value_str = f"{float(new_deg):.2f}"
+    replaced = {"count": 0, "old": None}
+
+    def _sub(match: re.Match) -> str:
+        replaced["count"] += 1
+        replaced["old"] = match.group("value")
+        return f"{match.group('prefix')}{new_value_str}{match.group('suffix')}"
+
+    updated = _OFFSET_ASSIGN_RE.sub(_sub, original, count=1)
+    if replaced["count"] == 0:
+        print(
+            f"[bake] could not find DEFAULT_MARKER_YAW_OFFSET_DEG assignment in "
+            f"{target_path}; leaving file unchanged.",
+            file=sys.stderr,
+        )
+        return None
+    if updated == original:
+        print(
+            f"[bake] DEFAULT_MARKER_YAW_OFFSET_DEG already {new_value_str} in "
+            f"{target_path}; nothing to change."
+        )
+        return target_path
+    try:
+        target_path.write_text(updated)
+    except OSError as exc:
+        print(f"[bake] could not write {target_path}: {exc}", file=sys.stderr)
+        return None
+    print(
+        f"[bake] {target_path}: DEFAULT_MARKER_YAW_OFFSET_DEG "
+        f"{replaced['old']} -> {new_value_str}"
+    )
+    return target_path
 
 
 def _angle_mean_deg(values_deg: list[float]) -> float:
@@ -187,6 +246,10 @@ def run_tune(args: argparse.Namespace) -> int:
     print(f"Sample stddev:                {std:.2f} deg  ({len(tail)} samples)")
     print(f"Delta from code default:      {delta_default:+.2f} deg")
     print(f"Use temporarily:              --marker-yaw-offset-deg {mean:+.2f}")
+    if args.bake:
+        bake_offset_into_source(mean)
+    else:
+        print("[bake] --no-bake set; source file left unchanged.")
     return 0
 
 
@@ -208,6 +271,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mocap-pos-key", default=DEFAULT_MOCAP_KEYS.pos)
     p.add_argument("--mocap-ori-key", default=DEFAULT_MOCAP_KEYS.ori)
     p.add_argument("--tracking-valid-key", default=DEFAULT_MOCAP_KEYS.tracking_valid)
+    p.add_argument(
+        "--no-bake",
+        dest="bake",
+        action="store_false",
+        default=True,
+        help="Skip auto-updating DEFAULT_MARKER_YAW_OFFSET_DEG in opti_planner.py.",
+    )
     return p.parse_args()
 
 
