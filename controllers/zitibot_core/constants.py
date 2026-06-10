@@ -262,6 +262,64 @@ EGG_CRACKER_STATIONARY_DETECTION_EE_POSITION = np.array(
 )
 EGG_CRACKER_STATIONARY_DETECTION_EE_ORIENTATION = EE_ORI_TOOL_DOWN_45;
 
+# World offset applied to the egg-cracker CRADLE-CENTER detection (the drop
+# point where the tong-held egg is released). This is a distinct target from
+# the cracker handle grasp, so it does NOT inherit
+# ``OBJECT_DEFAULTS[Object.EGG_CRACKER].gemini_world_offset_m`` (which is tuned
+# for the handle grasp). Land on the detected cradle center as-is.
+EGG_CRACKER_CRADLE_CENTER_WORLD_OFFSET_M = np.array([0.00, 0.00, 0.02], dtype=np.float64)
+
+# Whisk stationary waypoint / camera-framing pose (startup EE, 2026-06-06).
+WHISK_STATIONARY_WAYPOINT_EE_POSITION = np.array(
+    [+0.3070, -0.1024, +0.7044], dtype=np.float64
+)
+WHISK_STATIONARY_WAYPOINT_EE_ORIENTATION = np.array(
+    [
+        [-0.0830, +0.0287, +0.9961],
+        [-0.7036, -0.7096, -0.0382],
+        [+0.7057, -0.7040, +0.0791],
+    ],
+    dtype=np.float64,
+)
+WHISK_STATIONARY_DETECTION_EE_POSITION = WHISK_STATIONARY_WAYPOINT_EE_POSITION.copy()
+WHISK_STATIONARY_GRASP_EE_ORIENTATION = WHISK_STATIONARY_WAYPOINT_EE_ORIENTATION.copy()
+WHISK_STATIONARY_DETECTION_EE_ORIENTATION = WHISK_STATIONARY_WAYPOINT_EE_ORIENTATION.copy()
+# Nudge the Gemini midpoint this far along gripper +tool_z (forward) to land on
+# the handle (bench tune 2026-06).
+WHISK_GRASP_FORWARD_ALONG_TOOL_Z_M = 0.025
+WHISK_GRASP_WORLD_Z_OFFSET_M = 0.0
+WHISK_GRASP_OPEN_WIDTH_M = 0.078
+WHISK_GRASP_CLOSE_WIDTH_M = 0.05
+# Faster motion / settle tuning for the whisk pick-up sequence.
+WHISK_GRASP_FORCE_CLOSE_SETTLE_S = 1.0
+WHISK_ARM_SETTLE_TICKS = 1
+
+# Post-lift carry / place-hover waypoint (above bowl, before 10 cm descent).
+WHISK_STATIONARY_CARRY_EE_POSITION = np.array(
+    [+0.3403, -0.1320, +0.8481], dtype=np.float64
+)
+WHISK_STATIONARY_CARRY_EE_ORIENTATION = np.array(
+    [
+        [+0.0223, -0.0447, +0.9988],
+        [-0.6955, -0.7183, -0.0166],
+        [+0.7181, -0.6943, -0.0472],
+    ],
+    dtype=np.float64,
+)
+
+# Post-release red-tape camera framing (taught EE, 2026-06-07).
+WHISK_STATIONARY_RED_TAPE_EE_POSITION = np.array(
+    [+0.2338, -0.1471, +0.7273], dtype=np.float64
+)
+WHISK_STATIONARY_RED_TAPE_EE_ORIENTATION = np.array(
+    [
+        [-0.0877, -0.0472, +0.9950],
+        [-0.7415, -0.6639, -0.0968],
+        [+0.6652, -0.7463, +0.0232],
+    ],
+    dtype=np.float64,
+)
+
 # Per-bowl pour EE waypoint sequences. The arm walks forward through
 # these (upright -> tilted) at the pour station and then back to the
 # first waypoint so the bowl returns upright before the base drives
@@ -335,18 +393,20 @@ DEFAULT_GRIPPER_CLOSE_WIDTH = 0.0
 PRECISE_GRASP_WITHIN_M = 0.05
 PRECISE_GRASP_MAX_LINEAR_VELOCITY = 0.03
 # OTG angular-velocity cap (rad/s) while precise mode is engaged. The OTG
-# default is M_PI/3 (~1.047 rad/s, 60 deg/s); clamp to ~45 deg/s so wrist
+# default is M_PI/3 (~1.047 rad/s, 60 deg/s); clamp to ~30 deg/s so wrist
 # re-orientations (e.g. the egg-crack empty tilt) track accurately instead of
-# whipping around. Kept high enough that a 135 deg tilt still finishes inside
-# ``PRECISE_GRASP_MOVE_TIMEOUT_S`` (2.36 rad / 0.785 ~= 3.0 s).
-PRECISE_GRASP_MAX_ANGULAR_VELOCITY = float(np.pi / 4.0)
+# whipping around. A 135 deg tilt at this cap takes ~4.5 s (2.36 rad / 0.524),
+# so ``PRECISE_GRASP_MOVE_TIMEOUT_S`` is sized above that to let it finish.
+PRECISE_GRASP_MAX_ANGULAR_VELOCITY = float(np.pi / 6.0)
 PRECISE_GRASP_POSITION_KP = 400.0
 PRECISE_GRASP_ORIENTATION_KP = 400.0
 # Convergence budget (s) for the precise-mode "above" and descent moves. The
 # slow 0.03 m/s cap means the final 5 cm of the approach alone can take ~2 s,
 # so the default 4 s ``arm.move_to`` timeout is too tight — bump it for the
 # two moves precise mode affects (the lift afterwards runs at restored speed).
-PRECISE_GRASP_MOVE_TIMEOUT_S = 4
+# Also sized to cover the ~4.5 s a 135 deg empty tilt now takes at the lowered
+# 30 deg/s angular cap above.
+PRECISE_GRASP_MOVE_TIMEOUT_S = 6
 
 CYLINDER_GRASP_Z_DESCENT_REDUCTION_M = 0.07  # Lift grasp to prevent table collision
 DEFAULT_GRIPPER_PREGRASP_SETTLE_S = 0.6
@@ -400,15 +460,19 @@ class Object(enum.Enum):
     PARMESAN = "parmesan"
     SAUCE = "sauce"
     RICOTTA = "ricotta"
+    WHISK = "whisk"
 
 
 class BaseWaypoint(enum.Enum):
+    STIRRING_STATION = "stirring_station"
+    EGG_CRACK_STATION = "egg_crack_station"
     MIXING_STATION = "mixing_station"
     INGREDIENT_STATION = "ingredient_station"
     RACK_STATION = "rack_station"
     PRE_PAN_STATION = "pre_pan_station"
     PAN_STATION = "pan_station"
     OVEN_DOOR = "oven_door"
+    STOVE_STATION = "stove_station"
     SINK_STATION = "sink_station"
     PASTA_STATION = "pasta_station"
 
@@ -508,8 +572,15 @@ class ObjectSpec:
     force: float = DEFAULT_GRIPPER_FORCE
     pregrasp_settle_s: float = DEFAULT_GRIPPER_PREGRASP_SETTLE_S
     grasp_settle_s: float = DEFAULT_GRIPPER_GRASP_SETTLE_S
+    # Pause after GRASP-mode force-close (``grasp.object`` close_mode="grasp").
+    grasp_force_close_settle_s: float = 4.0
     approach_tol: float = DEFAULT_POS_TOL_M
     grasp_tol: float = DEFAULT_GRASP_TOL_M
+    # Extra shift applied along gripper +tool_z after Gemini world projection
+    # (positive = forward along the tool pointing direction).
+    grasp_forward_tool_z_m: float = 0.0
+    # Extra world +Z shift after Gemini projection (positive = up).
+    grasp_world_z_offset_m: float = 0.0
     gemini_world_offset_m: np.ndarray = field(
         default_factory=lambda: np.array([0.03, 0.0, 0.09], dtype=np.float64)
     )
@@ -529,8 +600,8 @@ OBJECT_DEFAULTS: dict[Object, ObjectSpec] = {
         # RealSense or sits outside the depth patch). The "above" pose
         # is then grasp + approach_dz (9 cm) above. If "left" looks
         # wrong on the bench, flip Y to -0.04.
-        gemini_world_offset_m=np.array([0.0, 0.04, 0.06], dtype=np.float64),
-        approach_dz=0.09,
+        gemini_world_offset_m=np.array([0.0, 0.0, -0.02], dtype=np.float64),
+        approach_dz=0.04,
     ),
     Object.MIXING_BOWL: ObjectSpec(
         pick_pose=np.array([0.17, 0.62, 0.50]),
@@ -559,16 +630,25 @@ OBJECT_DEFAULTS: dict[Object, ObjectSpec] = {
         # Goal = grasp point 1 + offset. +Z raises the flange above the
         # detected handle point; +Y is world-left (same as bowl rim tuning).
         # Bench tune (2026-06): 1 in lower than prior [0, 0, 0.06] (no XY shift).
-        gemini_world_offset_m=np.array([0.0, 0.04, 0.06 - 0.0224], dtype=np.float64),
+        gemini_world_offset_m=np.array([0.0, 0.00, -0.03], dtype=np.float64),
         # Pre-grasp "above" pose sits 3 cm above the grasp pose (vs. the
         # 15 cm global default). Short approach because the gripper is
         # already coming in low above the handle.
-        approach_dz=0.03,
+        approach_dz=0.04,
+        # The 4.0 s default force-close dwell is overkill for the pan handle —
+        # the gripper clamps in well under a second. Wait ~1 s so the relocation
+        # continues promptly after grasping.
+        grasp_force_close_settle_s=2.0,
     ),
     Object.LADLE: ObjectSpec(
         pick_pose=np.array([0.75, 0.68, 0.508]),
         rest_pose=np.array([0.75, 0.68, 0.508]),
-        gemini_world_offset_m=np.array([0.003, 0.0, 0.04], dtype=np.float64),
+        gemini_world_offset_m=np.array([0.00, 0.0, -0.04], dtype=np.float64),
+        approach_dz=0.08,
+        # The 4.0 s default force-close dwell is overkill for the ladle handle —
+        # the gripper clamps in well under a second. Shorten it so the routine
+        # continues to the lift promptly after grasping.
+        grasp_force_close_settle_s=1.0,
         # gemini_world_offset_m=np.zeros(3, dtype=np.float64),
     ),
     Object.EGG_CRACKER: ObjectSpec(
@@ -593,7 +673,7 @@ OBJECT_DEFAULTS: dict[Object, ObjectSpec] = {
         # strip and the fingers descend onto it — same convention as the
         # pan handle offset. No XY shift: the strip midpoint already centers
         # the gripper on the grip surface.
-        gemini_world_offset_m=np.array([0.00, 0.00, -0.015], dtype=np.float64),
+        gemini_world_offset_m=np.array([0.00, 0.00, -0.02], dtype=np.float64),
         # Short approach: arm is already framed close to the cracker for
         # detection, so the pre-grasp "above" pose only needs ~3 cm of
         # clearance above the grasp pose (matches the pan).
@@ -616,7 +696,7 @@ OBJECT_DEFAULTS: dict[Object, ObjectSpec] = {
         close_width=0.03,
         force=50.0,
         # Land on the detected tape midpoint; no XY/Z shift.
-        gemini_world_offset_m=np.array([0.00, 0.00, -0.02], dtype=np.float64),
+        gemini_world_offset_m=np.array([0.00, 0.00, -0.03], dtype=np.float64),
         approach_dz=0.08,
         # Thin tape marks: keep the grasp moves tight like the egg cracker.
         approach_tol=0.01,
@@ -633,11 +713,11 @@ OBJECT_DEFAULTS: dict[Object, ObjectSpec] = {
         # Fully open (saturates to the gripper max ~0.08 m) before descending.
         pregrasp_width=0.08,
         # Typical chicken egg short axis ~4–4.5 cm; wide enough not to crush.
-        close_width=0.045,
+        close_width=0.05,
         # Egg is round/symmetric: the grasp builder uses Gemini's single point
         # directly (no rim/axis offset). Override the ObjectSpec default
         # [0.03, 0, 0.09] so we land on the detected egg top, not 9 cm above it.
-        gemini_world_offset_m=np.zeros(3, dtype=np.float64),
+        gemini_world_offset_m=np.array([0.00, 0.00, 0.01], dtype=np.float64),
         approach_dz=0.08,
         approach_tol=0.01,
         grasp_tol=0.01,
@@ -665,6 +745,32 @@ OBJECT_DEFAULTS: dict[Object, ObjectSpec] = {
         close_width=0.04,
         gemini_world_offset_m=np.zeros(3, dtype=np.float64),
         approach_dz=0.25,
+    ),
+    # Whisk: Gemini returns two points along the red tape's long axis for the
+    # grasp XY/Z midpoint; wrist orientation is the fixed taught pose below
+    # (not axis-yawed). Force-based whisking in the black bowl is handled by
+    # Force-based whisking in the black bowl is handled by
+    # ``whisk_controller`` (see ``ZitiBot/controllers/whisk_controller.py``).
+    Object.WHISK: ObjectSpec(
+        grasp_ori=WHISK_STATIONARY_GRASP_EE_ORIENTATION.copy(),
+        grasp_align_jaws_to_detected_axis=False,
+        approach_along_tool_z=True,
+        pregrasp_width=WHISK_GRASP_OPEN_WIDTH_M,
+        open_width=WHISK_GRASP_OPEN_WIDTH_M,
+        # MOVE-mode grasp (``close_mode="move"``): stop at 4 cm and hold until
+        # the carry waypoint (see ``whisk_controller``).
+        close_width=WHISK_GRASP_CLOSE_WIDTH_M,
+        force=60.0,
+        speed=0.1,
+        pregrasp_settle_s=0.3,
+        grasp_settle_s=0.5,
+        grasp_force_close_settle_s=WHISK_GRASP_FORCE_CLOSE_SETTLE_S,
+        gemini_world_offset_m=np.array([0.02, 0.0, 0.0], dtype=np.float64),
+        grasp_forward_tool_z_m=WHISK_GRASP_FORWARD_ALONG_TOOL_Z_M,
+        grasp_world_z_offset_m=WHISK_GRASP_WORLD_Z_OFFSET_M,
+        approach_dz=0.03,
+        approach_tol=0.030,
+        grasp_tol=0.030,
     ),
 }
 
@@ -879,7 +985,10 @@ BASE_WAYPOINTS: dict[BaseWaypoint, OptiPose] = {
     # Both stations face lab +Y (yaw=90°), so "back" from the counter is −Y.
     # Backed off 15 cm in Y from the original counter-edge poses to give
     # the arm more clearance from the counter edge during transport.
-    
+    # Logged 2026-06-05: cart parked at stirring station (OptiTrack body frame).
+    BaseWaypoint.STIRRING_STATION: OptiPose(x_m=0.8555, y_m=-4.0656, yaw_deg=-90.0),
+    # Logged 2026-06-05: cart parked at egg crack station (OptiTrack body frame).
+    BaseWaypoint.EGG_CRACK_STATION: OptiPose(x_m=0.82, y_m=-4.09, yaw_deg=-90.0),
     BaseWaypoint.SINK_STATION: OptiPose(x_m=1.6, y_m=COUNTER_Y_OFFSET_M + 0.01, yaw_deg=90.0),
     BaseWaypoint.RACK_STATION: OptiPose(x_m=1.22, y_m=COUNTER_Y_OFFSET_M, yaw_deg=90.0),
     BaseWaypoint.INGREDIENT_STATION: OptiPose(x_m=1.12, y_m=COUNTER_Y_OFFSET_M, yaw_deg=90.0),
@@ -892,5 +1001,6 @@ BASE_WAYPOINTS: dict[BaseWaypoint, OptiPose] = {
     BaseWaypoint.PRE_PAN_STATION: OptiPose(x_m=0.44, y_m=COUNTER_Y_OFFSET_M, yaw_deg=90.0),
     BaseWaypoint.PAN_STATION: OptiPose(x_m=0.34, y_m=COUNTER_Y_OFFSET_M, yaw_deg=90.0),
     BaseWaypoint.OVEN_DOOR: OptiPose(x_m=0.88, y_m=-3.93, yaw_deg=0.0),
-    
+    # Logged 2026-06-05: cart parked at stove station (OptiTrack body frame).
+    BaseWaypoint.STOVE_STATION: OptiPose(x_m=1.5, y_m=-4.07, yaw_deg=-90.0),
 }

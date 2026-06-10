@@ -56,6 +56,14 @@ class OpenSaiRedisKeys:
     cartesian_task_otg_max_angular_velocity: str = (
         "opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::otg_max_angular_velocity"
     )
+    # Live OTG enable flag. Boolean written as a bare ``"0"`` / ``"1"`` string
+    # (parsed on the C++ side like the other receive-group scalars). Toggling
+    # it disables the internal online trajectory generator so streamed goal
+    # poses are tracked directly instead of being re-planned every write —
+    # useful when publishing a dense trajectory (e.g. the scramble stir).
+    cartesian_task_otg_enabled: str = (
+        "opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::otg_enabled"
+    )
     active_controller: str = "opensai::controllers::FrankaRobot::active_controller_name"
     config_file_name: str = "::sai-interfaces-webui::config_file_name"
     endeffector_transform: str = "opensai::redis_driver::FrankaRobot::T_end_effector"
@@ -78,6 +86,17 @@ class OpenSaiRedisKeys:
     )
     joint_task_goal_acceleration: str = (
         "opensai::controllers::FrankaRobot::joint_controller::joint_task::goal_acceleration"
+    )
+    # Live joint-task gains. Same naming as the sai-interfaces joint-task UI
+    # sliders (<joint_task prefix>::kp/kv/ki).
+    joint_task_kp: str = (
+        "opensai::controllers::FrankaRobot::joint_controller::joint_task::kp"
+    )
+    joint_task_kv: str = (
+        "opensai::controllers::FrankaRobot::joint_controller::joint_task::kv"
+    )
+    joint_task_ki: str = (
+        "opensai::controllers::FrankaRobot::joint_controller::joint_task::ki"
     )
 
 

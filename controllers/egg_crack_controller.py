@@ -4,7 +4,7 @@
 End-to-end sequence (``--vision``, default):
 
   1. Arm → home pose.
-  2. Base → ``INGREDIENT_STATION``.
+  2. Base → ``EGG_CRACK_STATION``.
   3. Arm → ``EGG_CRACKER_DETECTION_EE_POSITION`` for camera framing.
   4. Gemini detects the gray strip with a red cross-mark on the cracker
      handle and returns a perpendicular-yaw grasp pose (see
@@ -29,7 +29,7 @@ Usage::
   # Full vision + multi-station flow, ENTER-gated.
   ./ZitiBot/launch_zitibot_full.sh controllers/egg_crack_controller.py -- --step
 
-  # Same flow but skip the base drive to INGREDIENT_STATION (arm-only
+  # Same flow but skip the base drive to EGG_CRACK_STATION (arm-only
   # test when the cart is already parked in front of the cracker).
   ./ZitiBot/launch_zitibot_full.sh controllers/egg_crack_controller.py -- \\
       --skip-base --step
@@ -45,7 +45,6 @@ TidyBot base ``redis_driver``, RealSense, OptiTrack on Redis, and
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
 from pathlib import Path
@@ -60,6 +59,7 @@ from zitibot_core import arm, base, gains, gripper
 from zitibot_core.constants import (
     ARM_HOME_ORIENTATION,
     ARM_HOME_POSITION,
+    DEFAULT_GRIPPER_SPEED,
     DEFAULT_POS_TOL_M,
     EGG_CRACKER_DETECTION_EE_ORIENTATION,
     EGG_CRACKER_DETECTION_EE_POSITION,
@@ -140,6 +140,24 @@ EGG_CRACK_SHAKE_J0_CYCLES = 3
 EGG_CRACK_SHAKE_J0_TOL_RAD = 0.15
 EGG_CRACK_SHAKE_J0_TIMEOUT_S = 3.0
 
+# Post-crack / pour shake: wobble the EE about the pose held when called to
+# dislodge the egg/shell. The shake is CONTINUOUS — alternating end goals are
+# published straight to the cartesian controller with only a short dwell
+# (``EGG_CRACK_SHAKE_STROKE_S``) between flips and NO convergence/settle wait,
+# so the arm reverses through the center without ever coming to rest. Those
+# abrupt direction changes create the momentum swings that fling the shell off.
+# The post-crack shake wobbles left/right (world Y); the pour shake (cracker
+# upside-down over the bowl) wobbles up/down (world Z).
+EGG_CRACK_SHAKE_LR_AMP_M = 0.04      # post-crack wobble amplitude (world Y)
+EGG_CRACK_POUR_SHAKE_AMP_M = 0.05    # pour upside-down wobble amplitude (world Z, up/down)
+EGG_CRACK_SHAKE_STROKE_S = 0.30      # dwell between goal flips (no settle wait)
+# The shakes run in precise mode (stiff position/orientation gains so the wobble
+# tracks tightly) with the OTG linear cap RAISED above the normal default
+# (0.13 m/s) so the brisk flips build real momentum before each reversal.
+EGG_CRACK_SHAKE_MAX_LINEAR_VELOCITY = 0.20
+# The pour (upside-down) shake does fewer cycles than the post-crack dislodge.
+EGG_CRACK_POUR_SHAKE_CYCLES = 2
+
 # Transit carry lift between MIXING_STATION → SINK_STATION. Matches the
 # bowl_pour_controller value: ARM_HOME + this much in +Z gives a transit
 # pose that's a few cm above home so the cracker clears the counter on
@@ -161,45 +179,66 @@ SINK_DROP_SETTLE_S = 1.0
 # ---------------------------------------------------------------------------
 # Post-grasp egg-crack sequence geometry.
 #
-# Everything below is expressed as an offset from ``ARM_HOME_POSITION`` in
-# the arm/base frame (+X = forward, +Y = left, -Y = right, +Z = up) and runs
-# from a SINGLE base position — no base motion between the grasp, the crack,
-# and the release. The bowl and the cracker's pick spot are both assumed to
-# be reachable from where the vision grasp happened.
+# The crack and pour targets come from vision: each bowl's detected center
+# (depth of the valid pixel nearest the center) plus a tuned XY bias and a
+# fixed +Z hover above it. No base motion runs between the grasp, the crack,
+# and the release — the bowls and the cracker's pick spot are all reachable
+# from where the vision grasp happened.
 #
 # Sequence (after the cracker is grasped and lifted):
-#   1. Lift back to ARM_HOME.
-#   2. Above the bowl = home + (forward, left, -drop).
-#   3. Descend ``..._BOWL_DOWN_M`` into the bowl.
-#   4. Crack.  5. Shake.
-#   6. Move to the pour spot: ``..._EMPTY_AHEAD_M`` back (-X) and
-#      ``..._POUR_UP_M`` above the crack pose.
-#   7. Tilt ``..._EMPTY_TILT_DEG`` about world +X to empty the cracker.
-#   8. Right itself (back to home orientation, same position).
-#   9. Return to the pick spot, release.
-#  10. Lift straight up ``..._RELEASE_LIFT_M``, then return to ARM_HOME.
-EGG_CRACK_BOWL_FORWARD_M = 0.05   # +X toward the bowl (crack pose 5 cm back vs. the old 0.10)
-EGG_CRACK_BOWL_LEFT_M = 0.25      # +Y toward the bowl
-# Height of the above-bowl pose BELOW home (-Z). Lowering this drops the
-# above-bowl waypoint; ``..._BOWL_DOWN_M`` is reduced by the same amount so
-# the final crack depth is unchanged.
-EGG_CRACK_BOWL_DROP_FROM_HOME_M = 0.10  # -Z, above-bowl pose sits this far below home
-EGG_CRACK_BOWL_DOWN_M = 0.10      # -Z descent into the bowl before the squeeze
-# Crack and pour spots sit ``EGG_CRACK_EMPTY_AHEAD_M`` apart along +X. The two
-# were swapped vs. the bowl layout after testing, so the CRACK now happens at
-# the FORWARD spot (bowl-left base + this offset) and the POUR happens back at
-# the bowl-left base spot, lifted ``EGG_CRACK_POUR_UP_M`` above the crack so the
-# shell clears the rim on the way out.
-EGG_CRACK_EMPTY_AHEAD_M = 0.20    # +X separation between the crack and pour spots
-EGG_CRACK_POUR_UP_M = 0.10        # +Z lift of the pour spot above the crack height
+#   1. Above the crack bowl = black-bowl center + bias + 15 cm up. Crack here
+#      (no descend).
+#   2. Shake to dislodge, re-open to the hold width.
+#   3. Above the pour bowl = plastic-bowl center + bias + 15 cm up.
+#   4. Tilt ``..._EMPTY_TILT_DEG`` about world +X while rising
+#      ``..._POUR_TILT_RISE_M`` to empty the cracker, then right back down to
+#      the original position.
+#   5. Return to the pick spot, release.
+#   6. Lift straight up ``..._RELEASE_LIFT_M``, then return to ARM_HOME.
+
+# Camera-aim TRANSLATIONS from the home position (orientation stays level/home,
+# looking straight down — only the EE slides sideways in world Y). Negative Y
+# slides RIGHT to look down at the egg cracker grasp; positive Y slides LEFT to
+# look down at the bowls. Flip the sign / magnitude here or via
+# --cracker-look-dy-m / --bowls-look-dy-m if the camera lands over the wrong
+# spot on your bench.
+EGG_CRACK_CRACKER_LOOK_DY_M = -0.20
+EGG_CRACK_BOWLS_LOOK_DY_M = 0.30
+# Extra +Z raise applied ONLY to the bowls-look pose, so the camera backs off
+# and sees both bowls fully from above.
+EGG_CRACK_BOWLS_LOOK_DZ_M = 0.0
 EGG_CRACK_EMPTY_TILT_DEG = 135.0  # world-+X rotation to dump shell/egg residue
+EGG_CRACK_POUR_TILT_RISE_M = 0.20  # +Z the cracker rises WHILE tilting to pour
+# Loose convergence tolerance for the final pour (tilt-to-empty) pose — the
+# upside-down tilt only needs to roughly reach the empty-out attitude, so don't
+# stall waiting for the tight default position tolerance.
+EGG_CRACK_POUR_TILT_TOL_M = 0.08
+# The empty-out tilt runs in a slowed-down mode so the shell pours out gently,
+# but a bit faster than full precise-grasp speed (which is tuned for delicate
+# grasps). Allow a longer timeout than a normal move since it's still slow.
+EGG_CRACK_EMPTY_TILT_MAX_ANGULAR_VEL_RAD_S = 0.70  # ~40°/s (precise is ~30°/s)
+EGG_CRACK_EMPTY_TILT_MAX_LINEAR_VEL_M_S = 0.05      # precise is 0.03 m/s
+EGG_CRACK_POUR_TILT_TIMEOUT_S = 12.0
+# Open the post-crack hold grip by this much (m) vs the carry close width, so
+# the cracker is held a touch looser after the egg is cracked out.
+EGG_CRACK_POST_CRACK_WIDTH_DELTA_M = 0.005
 EGG_CRACK_RELEASE_LIFT_M = 0.10   # +Z straight-up lift after releasing the cracker
 
 # After the gripper opens, nudge up a touch and give a tiny J0 shake so the
 # cracker drops free of the open jaws before the full lift away.
 EGG_CRACK_RELEASE_NUDGE_UP_M = 0.01      # +Z nudge right after release
+# Loose 5 cm clearance lift right after grasping the cracker, so it clears the
+# table/its rest before transiting to the bowl. The tolerance must stay BELOW
+# the lift distance: arm.move_to converges on "within tol AND settled", so a
+# tolerance >= the lift would finish immediately and the arm wouldn't lift.
+CRACKER_PICKUP_LIFT_M = 0.05
+CRACKER_PICKUP_LIFT_TOL_M = 0.03
+# Timeout for the return-to-pick move before releasing the cracker. Generous
+# because it's a long move back from the pour spot and ``move_to`` opens the
+# gripper as soon as it returns — a short timeout drops the cracker mid-motion.
+EGG_CRACK_RELEASE_RETURN_TIMEOUT_S = 8.0
 EGG_CRACK_RELEASE_SHAKE_DELTA_DEG = 2.0  # per-stroke J0 amplitude for the post-release shake
-EGG_CRACK_RELEASE_SHAKE_CYCLES = 3       # UP/DOWN J0 cycles after release
+EGG_CRACK_RELEASE_SHAKE_CYCLES = 2       # UP/DOWN J0 cycles after release
 # The post-release shake is small (2°), so it needs a much tighter stroke
 # tolerance than the 6° crack shake — at the crack shake's 0.15 rad ≈ 8.6°
 # tol a 2° stroke is "already converged" and never moves. 0.015 rad ≈ 0.86°
@@ -248,12 +287,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Bowl-detection debug: go to the bowls-look pose, detect both bowl "
+            "drop centers, then move above the crack bowl and above the pour "
+            "bowl. No cracker grasp, no crack/pour — just verifies the bowl "
+            "vision + the resulting above-bowl waypoints."
+        ),
+    )
+    p.add_argument(
         "--skip-base",
         action="store_true",
         help=(
-            "Do not drive the base to INGREDIENT_STATION / MIXING_STATION / "
-            "SINK_STATION (vision mode only). Use when the cart is already "
-            "parked in front of the cracker for arm-only debugging."
+            "Do not drive the base to EGG_CRACK_STATION (vision mode only). "
+            "Use when the cart is already parked in front of the cracker "
+            "for arm-only debugging."
         ),
     )
 
@@ -391,6 +440,43 @@ def parse_args() -> argparse.Namespace:
             "current=live EE orientation at detection time."
         ),
     )
+    p.add_argument(
+        "--no-vision-bowls",
+        dest="vision_bowls",
+        action="store_false",
+        help=(
+            "Disable vision detection of the crack/pour bowl centers. NOTE: the "
+            "fixed-offset fallback was removed — the cycle now requires vision "
+            "bowls and will error if this is passed."
+        ),
+    )
+    p.set_defaults(vision_bowls=True)
+    p.add_argument(
+        "--cracker-look-dy-m",
+        type=float,
+        default=EGG_CRACK_CRACKER_LOOK_DY_M,
+        help=(
+            "World-Y translation from home to look straight down at the "
+            "cracker grasp. Negative slides right (default -0.20 m)."
+        ),
+    )
+    p.add_argument(
+        "--bowls-look-dy-m",
+        type=float,
+        default=EGG_CRACK_BOWLS_LOOK_DY_M,
+        help=(
+            "World-Y translation from home to look straight down at the bowls. "
+            "Positive slides left (default +0.20 m)."
+        ),
+    )
+    p.add_argument(
+        "--bowls-look-dz-m",
+        type=float,
+        default=EGG_CRACK_BOWLS_LOOK_DZ_M,
+        help=(
+            "Extra +Z raise applied to the bowls-look pose (default +0.10 m)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -401,25 +487,105 @@ def _vision_pick_pose(
     detection_xyz: tuple[float, float, float],
     retries: int,
     orientation_source: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Drive base + camera framing, run Gemini, return (pick_pos, grip_R)."""
+    detect_bowls: bool = True,
+    cracker_look_dy_m: float = EGG_CRACK_CRACKER_LOOK_DY_M,
+    bowls_look_dy_m: float = EGG_CRACK_BOWLS_LOOK_DY_M,
+    bowls_look_dz_m: float = EGG_CRACK_BOWLS_LOOK_DZ_M,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Home, drive base to the egg-crack station, then slide over to look.
+
+    Returns ``(pick_pos, grip_R, crack_center, pour_center)``. The EE keeps the
+    level home orientation (looking straight down) and just TRANSLATES in world
+    Y: first ``bowls_look_dy_m`` (positive = left) to look down at the crack
+    bowl (black ``PASTA_BOWL``) and the shell-pour bowl (white
+    ``PLASTIC_BOWL_TOP``) drop centers, each at the depth of the valid pixel
+    nearest the center, THEN ``cracker_look_dy_m`` (negative = right) to look
+    down at the cracker grasp. Detecting the cracker last leaves the EE at the
+    cracker look pose so the caller can grasp straight away. Either bowl center
+    is ``None`` if its detection is skipped/fails.
+    """
     detection_pos = np.asarray(detection_xyz, dtype=np.float64).reshape(3)
-    arm.move_to(
-        ctx,
-        detection_pos,
-        ARM_HOME_ORIENTATION,
-        label=f"[arm] move to detection pose {detection_pos.tolist()}",
-        tol_m=DEFAULT_POS_TOL_M,
-    )
+    _ = detection_pos  # retained for the (disabled) static detection-pose move
+
+    # arm.move_to(
+    #     ctx,
+    #     ARM_HOME_POSITION,
+    #     ARM_HOME_ORIENTATION,
+    #     label=f"[arm] move to home {ARM_HOME_POSITION.tolist()}",
+    #     tol_m=HOME_POS_TOL_M,
+    # )
 
     if not skip_base:
-        base.go_to_pose(ctx, BaseWaypoint.INGREDIENT_STATION)
+        # EGG_CRACK_STATION faces ~−170° (opposite the 90° counter stations).
+        # Holonomic XY+yaw together tends to slide sideways without a clean
+        # rotate-in-place; three_phase (approach → rotate → translate) matches
+        # OVEN_DOOR and lands the taught heading before the arm reaches out.
+        base.go_to_pose(
+            ctx, BaseWaypoint.EGG_CRACK_STATION, motion="three_phase"
+        )
+
+    # Detect the BOWLS FIRST: slide LEFT (world +Y) to look straight down at the
+    # crack/pour bowls and detect both drop centers. Save each overlay to its
+    # own filename so neither overwrites the cracker grasp overlay; restore the
+    # base path afterward. Orientation stays level/home; only position changes.
+    crack_center: np.ndarray | None = None
+    pour_center: np.ndarray | None = None
+    if detect_bowls:
+        look_bowls_pos = ARM_HOME_POSITION + np.array(
+            [0.0, float(bowls_look_dy_m), float(bowls_look_dz_m)], dtype=np.float64
+        )
+        arm.move_to(
+            ctx,
+            look_bowls_pos,
+            ARM_HOME_ORIENTATION,
+            label=(
+                f"[egg_crack] slide {bowls_look_dy_m * 100:+.0f} cm Y, "
+                f"{bowls_look_dz_m * 100:+.0f} cm Z to look down at the bowls "
+                f"{look_bowls_pos.tolist()}"
+            ),
+            tol_m=HOME_POS_TOL_M,
+            timeout_s=5.0
+        )
+        base_path = ctx.gemini_response_path
+        try:
+            if base_path:
+                ctx.gemini_response_path = _suffixed_path(base_path, "crack_bowl")
+            crack_center = gemini.find_bowl_drop_center(
+                ctx, Object.PASTA_BOWL, retries=retries
+            )
+            print(f"[egg_crack] crack bowl (black) center: {crack_center.tolist()}")
+            if base_path:
+                ctx.gemini_response_path = _suffixed_path(base_path, "pour_bowl")
+            pour_center = gemini.find_bowl_drop_center(
+                ctx, Object.PLASTIC_BOWL_TOP, retries=retries
+            )
+            print(f"[egg_crack] pour bowl (plastic) center: {pour_center.tolist()}")
+        finally:
+            ctx.gemini_response_path = base_path
+
+    # Detect the CRACKER GRASP LAST: slide RIGHT (world -Y) to look straight down
+    # at the cracker. The EE finishes here, so the caller can go straight into
+    # the grasp without an extra repositioning move.
+    look_cracker_pos = ARM_HOME_POSITION + np.array(
+        [0.0, float(cracker_look_dy_m), 0.0], dtype=np.float64
+    )
+    arm.move_to(
+        ctx,
+        look_cracker_pos,
+        ARM_HOME_ORIENTATION,
+        label=(
+            f"[egg_crack] slide {cracker_look_dy_m * 100:+.0f} cm in Y to look "
+            f"down at the cracker {look_cracker_pos.tolist()}"
+        ),
+        tol_m=HOME_POS_TOL_M,
+        timeout_s=8.0
+    )
 
     pose = gemini.find_grasp_pose(
         ctx,
         Object.EGG_CRACKER,
         retries=retries,
-        orientation_source=orientation_source,
+        orientation_source=orientation_source
     )
     pick_pos = pose.position.astype(np.float64, copy=True)
     grip_R = pose.orientation
@@ -431,7 +597,18 @@ def _vision_pick_pose(
         )
     else:
         print("[egg_crack] no perpendicular yaw applied (single-point detection)")
-    return pick_pos, grip_R
+
+    # Slide back to the home position before the grasp move so the cracker
+    # approach starts from a clean, centered pose.
+    # arm.move_to(
+    #     ctx,
+    #     ARM_HOME_POSITION,
+    #     ARM_HOME_ORIENTATION,
+    #     label="[egg_crack] slide back to home position",
+    #     tol_m=HOME_POS_TOL_M,
+    #     timeout_s=5.0,
+    # )
+    return pick_pos, grip_R, crack_center, pour_center
 
 
 def _suffixed_path(base: str | Path, suffix: str) -> str:
@@ -528,86 +705,99 @@ def _shake_j0_to_dislodge_egg(
 
     Falls back to a printed warning + no-op if joint positions aren't
     available from Redis (matches the jar's safety check).
+
+    Thin wrapper over :func:`arm.shake_joint` (the shared, joint-agnostic
+    shake helper), pinned to J0/base with the egg-crack warmup tunables.
     """
-    q_pre = arm.read_joint_positions(ctx.redis)
-    if q_pre is None or q_pre.size < 7:
-        print(
-            "[shake] WARNING: joint positions unavailable from Redis; "
-            "skipping J0 shake (warmup + cycles)."
-        )
+    arm.shake_joint(
+        ctx,
+        joint_index=0,
+        one_indexed=False,
+        shake_delta_deg=shake_delta_deg,
+        shake_cycles=shake_cycles,
+        tol_rad=tol_rad,
+        timeout_s=timeout_s,
+        use_warmup=use_warmup,
+        warmup_delta_deg=EGG_CRACK_SHAKE_J0_WARMUP_DELTA_DEG,
+        warmup_tol_rad=EGG_CRACK_SHAKE_J0_WARMUP_TOL_RAD,
+        warmup_timeout_s=EGG_CRACK_SHAKE_J0_WARMUP_TIMEOUT_S,
+        post_switch_wait_s=post_switch_wait_s,
+        label_prefix="[post-crack shake]",
+    )
+
+
+def _shake_ee(
+    ctx: TaskContext,
+    *,
+    axis: str = "y",
+    amp_m: float = EGG_CRACK_SHAKE_LR_AMP_M,
+    cycles: int = EGG_CRACK_SHAKE_J0_CYCLES,
+    stroke_s: float = EGG_CRACK_SHAKE_STROKE_S,
+    max_linear_velocity: float = EGG_CRACK_SHAKE_MAX_LINEAR_VELOCITY,
+    label_prefix: str = "[post-crack shake]",
+) -> None:
+    """Continuously oscillate the EE ±``amp_m`` along a world ``axis``.
+
+    ``axis="y"`` wobbles left/right; ``axis="z"`` wobbles up/down. A pure
+    cartesian oscillation about the pose held when called (no J0/base rotation,
+    no controller swap), holding the live orientation.
+
+    Unlike a sequence of ``arm.move_to`` strokes — which wait for the arm to
+    reach the endpoint AND stop (velocity-gated) between strokes — this
+    publishes the alternating end goals straight to the cartesian controller
+    and only dwells ``stroke_s`` between flips, with NO convergence wait. The
+    OTG retargets immediately, so the arm reverses through the center without
+    coming to rest; the abrupt direction changes are what fling the shell/egg
+    loose. Runs in precise mode (stiff gains) with a raised OTG linear cap so
+    the brisk flips build momentum.
+    """
+    pose = arm.read_current_ee_world(ctx.redis)
+    if pose is None:
+        print(f"{label_prefix} WARNING: EE pose unavailable; skipping shake.")
         return
-
-    # 1. Force the cartesian→joint controller swap before the first stroke.
-    if use_warmup:
-        # Warmup ("fake") move: small +delta J0 (base) nudge. Same mechanism as
-        # ``CYLINDER_DUMP_WARMUP_DELTA_DEG`` in the jar pour.
-        q0_warmup_rad = float(q_pre[0]) + math.radians(
-            EGG_CRACK_SHAKE_J0_WARMUP_DELTA_DEG
-        )
-        print(
-            f"[shake-warmup] J0 warm-up nudge to "
-            f"{math.degrees(q0_warmup_rad):+.1f}° "
-            f"(forces cartesian→joint controller swap)"
-        )
-        arm.move_to_joints_partial(
-            ctx,
-            {0: q0_warmup_rad},
-            degrees=False,
-            one_indexed=False,
-            label=(
-                f"  [arm] post-crack shake warm-up J0"
-                f"={math.degrees(q0_warmup_rad):+.1f}°"
-            ),
-            tol_rad=EGG_CRACK_SHAKE_J0_WARMUP_TOL_RAD,
-            timeout_s=EGG_CRACK_SHAKE_J0_WARMUP_TIMEOUT_S,
-            gated=False,
-        )
+    center = np.asarray(pose[0], dtype=np.float64).reshape(3)
+    ori = np.asarray(pose[1], dtype=np.float64).reshape(3, 3)
+    ax = axis.strip().lower()
+    if ax == "z":
+        step = np.array([0.0, 0.0, float(amp_m)], dtype=np.float64)
+        a_name, b_name = "UP", "DOWN"
+    elif ax == "y":
+        step = np.array([0.0, float(amp_m), 0.0], dtype=np.float64)
+        a_name, b_name = "LEFT", "RIGHT"
     else:
-        # No fake command: seed the CURRENT joints as the goal (zero motion),
-        # switch cartesian→joint, then wait for the swap to settle before the
-        # first stroke. Testing whether the wait alone removes the need for
-        # the warmup nudge.
-        print(
-            f"[shake] no warmup; seeding current joints + switching to joint "
-            f"controller, waiting {post_switch_wait_s * 1000:.0f} ms for swap."
-        )
-        arm.publish_goal_joint(ctx.redis, q_pre)
-        if post_switch_wait_s > 0:
-            time.sleep(post_switch_wait_s)
-
-    # 2. Shake cycles: J0 (base) ±delta, repeated.
-    delta_deg = float(shake_delta_deg)
-    cycles = int(shake_cycles)
-    for cycle in range(cycles):
-        for direction, sign in (("UP", +1.0), ("DOWN", -1.0)):
-            q_now = arm.read_joint_positions(ctx.redis)
-            if q_now is None or q_now.size < 7:
+        raise ValueError(f"shake axis must be 'y' or 'z', got {axis!r}")
+    pos_a = center + step
+    pos_b = center - step
+    precise = gains.apply_precise_grasp(
+        ctx.redis,
+        max_linear_velocity=max_linear_velocity,
+        position_kp=PRECISE_GRASP_POSITION_KP,
+        orientation_kp=PRECISE_GRASP_ORIENTATION_KP,
+        label=f"{label_prefix} shake",
+    )
+    try:
+        for cyc in range(int(cycles)):
+            for name, target in ((a_name, pos_a), (b_name, pos_b)):
                 print(
-                    f"[shake cyc {cycle + 1}/{cycles} {direction}] "
-                    f"WARNING: joint positions unavailable; aborting shake."
+                    f"{label_prefix} cyc {cyc + 1}/{int(cycles)} {name} "
+                    f"(±{amp_m * 100:.0f} cm world {ax.upper()}) {target.tolist()}",
+                    flush=True,
                 )
-                return
-            q0_now = float(q_now[0])
-            q0_goal = q0_now + sign * math.radians(delta_deg)
-            print(
-                f"[shake cyc {cycle + 1}/{cycles} {direction}] "
-                f"J0 {math.degrees(q0_now):+.1f}° → "
-                f"{math.degrees(q0_goal):+.1f}° "
-                f"({'+' if sign > 0 else '-'}{delta_deg:.0f}°)"
-            )
-            arm.move_to_joints_partial(
-                ctx,
-                {0: q0_goal},
-                degrees=False,
-                one_indexed=False,
-                label=(
-                    f"  [arm] post-crack shake cyc {cycle + 1} {direction} "
-                    f"J0={math.degrees(q0_goal):+.1f}°"
-                ),
-                tol_rad=tol_rad,
-                timeout_s=timeout_s,
-                gated=False,
-            )
+                # Publish the goal and flip after a short dwell WITHOUT waiting
+                # for convergence, so the arm never settles between strokes.
+                arm.publish_goal_cartesian(ctx.redis, target, ori)
+                time.sleep(float(stroke_s))
+        # Settle back to the center pose (this one we let actually arrive).
+        arm.move_to(
+            ctx,
+            center,
+            ori,
+            label=f"{label_prefix} return to center {center.tolist()}",
+            tol_m=0.02,
+            timeout_s=2.0,
+        )
+    finally:
+        gains.restore_precise_grasp(ctx.redis, precise, label=f"{label_prefix} shake")
 
 
 def _drop_at_sink(
@@ -646,7 +836,7 @@ def _drop_at_sink(
     gripper.open_gripper(
         ctx.redis,
         spec.open_width,
-        speed=spec.speed,
+        speed=DEFAULT_GRIPPER_SPEED,
         force=spec.force,
         use_max_mode=True,
     )
@@ -674,41 +864,44 @@ def run_egg_crack_cycle(
     gemini_response_path: str | None = None,
     sink_drop_dz_m: float = SINK_DROP_DZ_M,
     sink_drop_dx_m: float = SINK_DROP_DX_M,
+    use_vision_bowls: bool = True,
+    cracker_look_dy_m: float = EGG_CRACK_CRACKER_LOOK_DY_M,
+    bowls_look_dy_m: float = EGG_CRACK_BOWLS_LOOK_DY_M,
+    bowls_look_dz_m: float = EGG_CRACK_BOWLS_LOOK_DZ_M,
 ) -> None:
     """Vision-driven egg-crack flow, run from a single base position.
 
     The vision grasp frames + grasps the cracker (driving the base to
-    INGREDIENT_STATION only if ``skip_base`` is False). Everything after
-    the grasp runs WITHOUT further base motion — the bowl and the pick
-    spot are both reachable from the grasp position. Offsets are relative
-    to ``ARM_HOME_POSITION`` (+X forward, +Y left, -Y right, +Z up):
+    EGG_CRACK_STATION only if ``skip_base`` is False). Everything after
+    the grasp runs WITHOUT further base motion — the bowls and the pick
+    spot are all reachable from the grasp position. The crack/pour targets
+    come from the detected bowl centers (vision is required):
 
     1. Frame the cracker, Gemini grasp, ``grasp.object`` closes (width-based,
        ``close_mode="move"`` to ``EGG_CRACKER_GRASP_WIDTH_M``, held). No
        post-grasp carry lift.
-    2. Move straight to above the bowl (home + forward + left - drop) — no
-       intermediate home pose. The crack happens at the FORWARD spot
-       (bowl-left base + ``EGG_CRACK_EMPTY_AHEAD_M``).
-    3. Descend into the bowl, ``egg_crack.crack`` (force-based, ~140 N) to break
-       the egg, and KEEP squeezing at the crack force through the shake.
-    4. Joint-space ``_shake_j0_to_dislodge_egg`` (fake warmup + J0 ±δ shake)
-       while still squeezing, then re-open to the hold WIDTH so the cracker is
-       held, not crushed shut.
-    5. Move to the pour spot: ``EGG_CRACK_EMPTY_AHEAD_M`` back (-X) and
-       ``EGG_CRACK_POUR_UP_M`` above the crack pose.
-    6. Tilt ``EGG_CRACK_EMPTY_TILT_DEG`` about world +X to empty the cracker,
-       then right itself (back to home orientation, holding position).
-    7. Return to the pick spot and release the cracker.
-    8. Nudge up ``EGG_CRACK_RELEASE_NUDGE_UP_M`` + tiny J0 shake to drop it free.
-    9. Lift straight up ``EGG_CRACK_RELEASE_LIFT_M``, then return to ARM_HOME.
+    2. Move to above the crack bowl (black-bowl center + XY bias + 15 cm up)
+       and ``egg_crack.crack`` (force-based, ~140 N) from that hover pose
+       (no descend), KEEP squeezing through the shake.
+    3. Lateral ``_shake_ee`` (continuous EE wobble ±EGG_CRACK_SHAKE_LR_AMP_M
+       along world Y) while still squeezing, then re-open to the hold WIDTH so
+       the cracker is held, not crushed shut.
+    4. Move to above the pour bowl (plastic-bowl center + XY bias + 15 cm up).
+    5. Tilt ``EGG_CRACK_EMPTY_TILT_DEG`` about world +X while rising
+       ``EGG_CRACK_POUR_TILT_RISE_M`` to empty the cracker, then an up/down
+       ``_shake_ee`` (continuous, world Z) shakes out residue before it rights
+       itself back down to the original position.
+    6. Return to the pick spot and release the cracker.
+    7. Nudge up ``EGG_CRACK_RELEASE_NUDGE_UP_M`` + tiny J0 shake to drop it free.
+    8. Lift straight up ``EGG_CRACK_RELEASE_LIFT_M``, then return to ARM_HOME.
     """
     if gemini_response_path is not None:
         ctx.gemini_response_path = gemini_response_path
     if detection_xyz is None:
         detection_xyz = tuple(float(v) for v in EGG_CRACKER_DETECTION_EE_POSITION)
     # ``crack_xyz`` is accepted for backwards-compat but no longer drives the
-    # crack pose: the bowl is now reached as a fixed offset from ARM_HOME
-    # (see EGG_CRACK_BOWL_* constants), so there is no taught crack pose.
+    # crack pose: the crack target now comes from the detected black-bowl center,
+    # so there is no taught crack pose.
     _ = crack_xyz
 
     if ctx.gemini_response_path is None:
@@ -718,12 +911,16 @@ def run_egg_crack_cycle(
     # the grasp pose directly. (The earlier two-stage coarse→refine flow was
     # removed: the close-up Gemini #2 photo was occluded by the gripper and
     # the calibrated extrinsic now puts the first-pass grasp within ~1 cm.)
-    pick, grip_R = _vision_pick_pose(
+    pick, grip_R, crack_center, pour_center = _vision_pick_pose(
         ctx,
         skip_base=skip_base,
         detection_xyz=detection_xyz,
         retries=retries,
         orientation_source=orientation_source,
+        detect_bowls=use_vision_bowls,
+        cracker_look_dy_m=cracker_look_dy_m,
+        bowls_look_dy_m=bowls_look_dy_m,
+        bowls_look_dz_m=bowls_look_dz_m,
     )
 
     # Final grasp: grasp.object moves above the pick, descends, and closes on
@@ -744,49 +941,47 @@ def run_egg_crack_cycle(
         close_mode="move",
     )
 
-    # 1. Move straight from holding the cracker to above the bowl: forward
-    # (+X), left (+Y), and below (-Z) home. No intermediate home pose, no
-    # post-grasp carry lift — the path up-and-over to here clears the counter.
-    # The crack happens at the FORWARD spot (bowl-left base + EMPTY_AHEAD),
-    # since the crack and pour spots were swapped vs. the bowl layout.
-    crack_forward_m = EGG_CRACK_BOWL_FORWARD_M + EGG_CRACK_EMPTY_AHEAD_M
-    above_bowl = ARM_HOME_POSITION + np.array(
-        [
-            crack_forward_m,
-            EGG_CRACK_BOWL_LEFT_M,
-            -EGG_CRACK_BOWL_DROP_FROM_HOME_M,
-        ],
-        dtype=np.float64,
-    )
+    # Loose 5 cm clearance lift so the cracker clears the table/rest before the
+    # transit to the bowl. Relative to the current pose; loose (< lift) tol so
+    # it doesn't burn time converging precisely.
+    lift_pose = arm.read_current_ee_world(ctx.redis)
+    if lift_pose is not None:
+        clearance = np.asarray(lift_pose[0], dtype=np.float64).reshape(3) + np.array(
+            [0.0, 0.0, CRACKER_PICKUP_LIFT_M], dtype=np.float64
+        )
+        arm.move_to(
+            ctx,
+            clearance,
+            grip_R,
+            label=(
+                f"[egg_crack] clearance lift after cracker pickup "
+                f"+{CRACKER_PICKUP_LIFT_M * 100:.0f} cm -> {clearance.tolist()}"
+            ),
+            tol_m=CRACKER_PICKUP_LIFT_TOL_M,
+        )
+
+    # Vision bowl centers are required (the production flow always detects them).
+    if crack_center is None or pour_center is None:
+        raise RuntimeError(
+            "egg_crack requires vision bowl centers; run with vision bowls enabled "
+            "(do not pass --no-vision-bowls)"
+        )
+
+    # 1. Move from holding the cracker to above the crack bowl: the detected
+    # black-bowl center + a tuned XY bias and 15 cm up. The egg is cracked from
+    # this hover pose (no descend). The X bias corrects the arm's reach
+    # undershoot toward the bowl.
+    above_crack = crack_center + np.array([-0.15, 0.00, 0.15], dtype=np.float64)
     arm.move_to(
         ctx,
-        above_bowl,
+        above_crack,
         ARM_HOME_ORIENTATION,
-        label=(
-            f"[egg_crack] above bowl {above_bowl.tolist()} "
-            f"(+{crack_forward_m * 100:.0f} cm fwd, "
-            f"+{EGG_CRACK_BOWL_LEFT_M * 100:.0f} cm left, "
-            f"-{EGG_CRACK_BOWL_DROP_FROM_HOME_M * 100:.0f} cm below home)"
-        ),
+        label=f"[egg_crack] above crack bowl {above_crack.tolist()} (vision black bowl)",
         tol_m=DEFAULT_POS_TOL_M,
+        timeout_s=9.0,
     )
 
-    # 2. Descend into the bowl before the squeeze.
-    crack_pos = above_bowl + np.array(
-        [0.0, 0.0, -EGG_CRACK_BOWL_DOWN_M], dtype=np.float64
-    )
-    arm.move_to(
-        ctx,
-        crack_pos,
-        ARM_HOME_ORIENTATION,
-        label=(
-            f"[egg_crack] descend {EGG_CRACK_BOWL_DOWN_M * 100:.0f} cm into "
-            f"bowl {crack_pos.tolist()}"
-        ),
-        tol_m=DEFAULT_POS_TOL_M,
-    )
-
-    # 3. Crack the egg into the bowl. The crack squeeze force-closes the jaws
+    # 2. Crack the egg into the bowl. The crack squeeze force-closes the jaws
     # all the way and KEEPS squeezing at the crack force through the shake
     # below, so the cracker stays clamped while the egg/shell is wobbled free.
     egg_crack.crack(
@@ -795,77 +990,65 @@ def run_egg_crack_cycle(
         lift_force=gripper_lift_force,
     )
 
-    # 4. Switch to joint control, do the "fake" warmup nudge, then shake J0
-    # (the base joint) ±delta for ``shake_cycles`` cycles to dislodge the egg
-    # yolk / shell off the cracker fingers. Mirrors the jar pour's post-dump
-    # J4 shake (just on J0/base with a 3° amplitude instead of J4 at 10°). The
-    # gripper is still squeezing at the crack force here.
+    # 3. Shake the EE left/right (±EGG_CRACK_SHAKE_LR_AMP_M along world Y) for
+    # ``shake_cycles`` cycles to dislodge the egg yolk / shell off the cracker
+    # fingers. Continuous (no settle between strokes). The gripper is still
+    # squeezing at the crack force here.
     if not no_shake:
-        _shake_j0_to_dislodge_egg(
-            ctx,
-            shake_delta_deg=shake_delta_deg,
-            shake_cycles=shake_cycles,
-        )
+        _shake_ee(ctx, axis="y", amp_m=EGG_CRACK_SHAKE_LR_AMP_M, cycles=shake_cycles)
     else:
         print("[shake] skipped (--no-shake).")
 
-    # 4b. Now that the shake has dislodged the egg, release the crack squeeze
+    # 3b. Now that the shake has dislodged the egg, release the crack squeeze
     # back to the hold (pick-up) WIDTH so the cracker is held at its carry grip
     # again instead of crushed shut for the rest of the sequence.
     crack_spec = OBJECT_DEFAULTS[Object.EGG_CRACKER]
+    hold_width = max(
+        0.0, crack_spec.close_width + EGG_CRACK_POST_CRACK_WIDTH_DELTA_M
+    )
     step_gate(
         ctx,
-        f"[egg_crack] release to hold width {crack_spec.close_width:.4f} m "
-        f"(move-open from the crack squeeze)",
+        f"[egg_crack] release to hold width {hold_width:.4f} m "
+        f"(move-open from the crack squeeze, 1 cm wider)",
     )
     gripper.move(
         ctx.redis,
-        crack_spec.close_width,
-        speed=crack_spec.speed,
+        hold_width,
+        speed=DEFAULT_GRIPPER_SPEED,
         force=gripper_lift_force,
     )
     time.sleep(0.4)
 
-    # 5. Move to the empty-out (pour) spot: back (-X) from the crack pose by
-    # EGG_CRACK_EMPTY_AHEAD_M and up (+Z) by EGG_CRACK_POUR_UP_M so the cracker
-    # tips out above the bowl rim (crack and pour spots are swapped vs. the
-    # bowl layout, so the pour is behind the crack now).
-    pour_spot = crack_pos + np.array(
-        [-EGG_CRACK_EMPTY_AHEAD_M, 0.0, EGG_CRACK_POUR_UP_M], dtype=np.float64
-    )
+    # 4. Move to the pour spot above the WHITE plastic bowl: the detected
+    # plastic-bowl center + a tuned XY bias and 15 cm up.
+    above_pour = pour_center + np.array([-0.15, 0.10, 0.15], dtype=np.float64)
     arm.move_to(
         ctx,
-        pour_spot,
+        above_pour,
         ARM_HOME_ORIENTATION,
-        label=(
-            f"[egg_crack] move to pour spot {pour_spot.tolist()} "
-            f"({EGG_CRACK_EMPTY_AHEAD_M * 100:.0f} cm back, "
-            f"+{EGG_CRACK_POUR_UP_M * 100:.0f} cm up from crack)"
-        ),
+        label=f"[egg_crack] above pour bowl {above_pour.tolist()} (vision plastic bowl)",
         tol_m=DEFAULT_POS_TOL_M,
+        timeout_s=4.0,
     )
 
-    # 6. Tilt about WORLD +X to empty the cracker. Build a clean "pointing
-    # straight down" base orientation: tool +Z is forced to exactly world -Z
-    # and tool +Y to horizontal, so the frame is dead straight/level. The 135°
-    # roll is then applied (positive) about the fixed WORLD +X axis (a
-    # pre-multiply, see ``arm.pour_orientation_end``). Position is held at the
-    # live pour-start position (the prior move only reaches pour_spot within
-    # tolerance). Run the roll in precise mode (stiffer cart position/
-    # orientation kp + slower OTG cap) so it tracks accurately; precise mode is
-    # taken back off before righting it back to the straight-down base.
+    # 5. Tilt about WORLD +X while rising EGG_CRACK_POUR_TILT_RISE_M to empty the
+    # cracker over the pour bowl, then right it back to the original position.
+    # Build a clean "pointing straight down" base orientation (tool +Z = world
+    # -Z, tool +X leveled into the horizontal) and roll EGG_CRACK_EMPTY_TILT_DEG
+    # (positive) about the fixed WORLD +X axis. Position is taken from the live
+    # pour-start pose. The tilt runs in precise mode (stiffer cart kp + slower
+    # OTG cap) for accurate tracking; precise mode is taken back off before
+    # righting it.
     pour_pose = arm.read_current_ee_world(ctx.redis)
     if pour_pose is not None:
         pour_pos = pour_pose[0]
     else:
         print(
             "[egg_crack] WARNING: live EE pose unavailable at pour start; "
-            "using commanded pour-spot position."
+            "using commanded above-pour position."
         )
-        pour_pos = pour_spot
+        pour_pos = above_pour
 
-    # Straight-down base: level the home tool +X heading into the horizontal
-    # plane, point tool +Z straight down, complete a right-handed frame.
     tool_x = ARM_HOME_ORIENTATION[:, 0].astype(np.float64).copy()
     tool_x[2] = 0.0
     nx = float(np.linalg.norm(tool_x))
@@ -878,10 +1061,15 @@ def run_egg_crack_cycle(
     tilted_ori = arm.pour_orientation_end(
         straight_down_R, EGG_CRACK_EMPTY_TILT_DEG, axis="x"
     )
-    precise_snapshot = gains.apply_precise_grasp(
+    pour_up_pos = pour_pos + np.array(
+        [0.0, 0.00, EGG_CRACK_POUR_TILT_RISE_M], dtype=np.float64
+    )
+    # Run the empty-out tilt in precise mode (slower OTG cap) so the shell pours
+    # out slowly; take precise mode back off before the shake + righting.
+    pour_precise = gains.apply_precise_grasp(
         ctx.redis,
-        max_linear_velocity=PRECISE_GRASP_MAX_LINEAR_VELOCITY,
-        max_angular_velocity=PRECISE_GRASP_MAX_ANGULAR_VELOCITY,
+        max_linear_velocity=EGG_CRACK_EMPTY_TILT_MAX_LINEAR_VEL_M_S,
+        max_angular_velocity=EGG_CRACK_EMPTY_TILT_MAX_ANGULAR_VEL_RAD_S,
         position_kp=PRECISE_GRASP_POSITION_KP,
         orientation_kp=PRECISE_GRASP_ORIENTATION_KP,
         label="egg_crack:empty-tilt",
@@ -889,51 +1077,82 @@ def run_egg_crack_cycle(
     try:
         arm.move_to(
             ctx,
-            pour_pos,
+            pour_up_pos,
             tilted_ori,
             label=(
                 f"[egg_crack] tilt {EGG_CRACK_EMPTY_TILT_DEG:.0f}° about world +X "
-                f"to empty cracker (precise mode, straight-down base)"
+                f"+ rise {EGG_CRACK_POUR_TILT_RISE_M * 100:.0f} cm to empty cracker (slow)"
             ),
-            tol_m=DEFAULT_POS_TOL_M,
-            timeout_s=PRECISE_GRASP_MOVE_TIMEOUT_S,
+            tol_m=EGG_CRACK_POUR_TILT_TOL_M,
+            timeout_s=EGG_CRACK_POUR_TILT_TIMEOUT_S,
         )
     finally:
-        # Take precise mode off for the un-rotation (and everything after),
-        # even if the tilt timed out or was interrupted.
-        gains.restore_precise_grasp(
-            ctx.redis, precise_snapshot, label="egg_crack:empty-tilt"
-        )
-    # Right itself: back to the clean straight-down base (same position, tool
-    # pointing straight down again).
+        gains.restore_precise_grasp(ctx.redis, pour_precise, label="egg_crack:empty-tilt")
+
+    # Shake up/down (±EGG_CRACK_POUR_SHAKE_AMP_M along world Z) in the tilted
+    # (upside-down) pose to shake out any remaining shell/egg. Continuous (no
+    # settle between strokes). Holds the live tilted orientation.
+    _shake_ee(
+        ctx,
+        axis="z",
+        amp_m=EGG_CRACK_POUR_SHAKE_AMP_M,
+        cycles=EGG_CRACK_POUR_SHAKE_CYCLES,
+        label_prefix="[pour shake]",
+    )
+
+    # Then shake left/right (±EGG_CRACK_POUR_SHAKE_AMP_M along world Y) in the
+    # same tilted pose to dislodge anything the up/down stroke didn't.
+    _shake_ee(
+        ctx,
+        axis="y",
+        amp_m=EGG_CRACK_POUR_SHAKE_AMP_M,
+        cycles=EGG_CRACK_POUR_SHAKE_CYCLES,
+        label_prefix="[pour shake LR]",
+    )
+
+    # Right itself: back to the original position, tool pointing straight down.
+    after_pour_pos = pour_pos + np.array([0.0, 0.0, 0.05], dtype=np.float64)
     arm.move_to(
         ctx,
-        pour_pos,
+        after_pour_pos,
         straight_down_R,
-        label="[egg_crack] right cracker (back to straight-down orientation)",
+        label="[egg_crack] right cracker (back to original position with +Z offset, straight-down)",
         tol_m=DEFAULT_POS_TOL_M,
     )
 
-    # 7. Return to the pick spot and release the cracker.
+    # 6. Return to the pick spot and release the cracker. Use a generous
+    # timeout: this is a long move back from the pour spot, and ``move_to``
+    # continues even on timeout — too short a timeout means the gripper opens
+    # while the arm is still moving and the cracker gets flung/dropped early.
+    above_pick = pick + np.array([0.00, 0.00, 0.08], dtype=np.float64)
+    arm.move_to(
+        ctx,
+        above_pick,
+        grip_R,
+        label=f"[egg_crack] return to above pick spot {above_pick.tolist()} to release",
+        tol_m=DEFAULT_POS_TOL_M,
+        timeout_s=EGG_CRACK_RELEASE_RETURN_TIMEOUT_S,
+    )
     arm.move_to(
         ctx,
         pick,
         grip_R,
         label=f"[egg_crack] return to pick spot {pick.tolist()} to release",
         tol_m=DEFAULT_POS_TOL_M,
+        timeout_s=EGG_CRACK_RELEASE_RETURN_TIMEOUT_S,
     )
     spec = OBJECT_DEFAULTS[Object.EGG_CRACKER]
     gripper.open_gripper(
         ctx.redis,
         spec.open_width,
-        speed=spec.speed,
+        speed=DEFAULT_GRIPPER_SPEED,
         force=spec.force,
         use_max_mode=True,
     )
     print("[egg_crack] gripper opened — cracker released at pick spot.")
     time.sleep(SINK_DROP_SETTLE_S)
 
-    # 8. Nudge up 1 cm and give a tiny J0 shake so the cracker drops free of
+    # 7. Nudge up 1 cm and give a tiny J0 shake so the cracker drops free of
     # the open jaws before lifting away.
     release_nudge = pick + np.array(
         [0.0, 0.0, EGG_CRACK_RELEASE_NUDGE_UP_M], dtype=np.float64
@@ -958,7 +1177,7 @@ def run_egg_crack_cycle(
         post_switch_wait_s=EGG_CRACK_RELEASE_SHAKE_POST_SWITCH_WAIT_S,
     )
 
-    # 9. Lift straight up from the pick, then return to home.
+    # 8. Lift straight up from the pick, then return to home.
     release_lift = pick + np.array(
         [0.0, 0.0, EGG_CRACK_RELEASE_LIFT_M], dtype=np.float64
     )
@@ -981,6 +1200,232 @@ def run_egg_crack_cycle(
     )
 
 
+# def run_bowl_debug_cycle(
+#     ctx: TaskContext,
+#     *,
+#     skip_base: bool = False,
+#     retries: int = 1,
+#     bowls_look_dy_m: float = EGG_CRACK_BOWLS_LOOK_DY_M,
+#     bowls_look_dz_m: float = EGG_CRACK_BOWLS_LOOK_DZ_M,
+#     gripper_lift_force: float = 8.0,
+#     gripper_crack_force: float = 140.0,
+#     shake_delta_deg: float = EGG_CRACK_SHAKE_J0_DELTA_DEG,
+#     shake_cycles: int = EGG_CRACK_SHAKE_J0_CYCLES,
+#     no_shake: bool = False,
+#     gemini_response_path: str | None = None,
+# ) -> None:
+#     """Bowl-vision debug: detect both bowls, crack over one, pour over the other.
+
+#     Goes home, slides to the bowls-look pose (left + up), detects the crack
+#     bowl (black ``PASTA_BOWL``) and the pour bowl (white ``PLASTIC_BOWL_TOP``)
+#     drop centers, then moves to the above-the-crack-bowl waypoint and runs the
+#     crack squeeze + J0 shake there, then moves to the above-the-pour-bowl
+#     waypoint and runs the pour tilt/right motion there. Uses the same poses and
+#     motions the real cycle uses, just without grasping the cracker first (the
+#     cracker is assumed to be pre-placed in the gripper for the motion test).
+#     """
+#     if gemini_response_path is not None:
+#         ctx.gemini_response_path = gemini_response_path
+#     if ctx.gemini_response_path is None:
+#         ctx.gemini_response_path = str(DEFAULT_GEMINI_RESPONSE_PATH)
+
+#     arm.move_to(
+#         ctx,
+#         ARM_HOME_POSITION,
+#         ARM_HOME_ORIENTATION,
+#         label=f"[egg_crack:debug] move to home {ARM_HOME_POSITION.tolist()}",
+#         tol_m=HOME_POS_TOL_M,
+#     )
+#     if not skip_base:
+#         base.go_to_pose(ctx, BaseWaypoint.EGG_CRACK_STATION, motion="three_phase")
+
+#     # Slide LEFT (+Y) and UP (+Z) to look straight down at the bowls.
+#     look_bowls_pos = ARM_HOME_POSITION + np.array(
+#         [0.00, float(bowls_look_dy_m), float(bowls_look_dz_m)], dtype=np.float64
+#     )
+#     arm.move_to(
+#         ctx,
+#         look_bowls_pos,
+#         ARM_HOME_ORIENTATION,
+#         label=(
+#             f"[egg_crack:debug] slide {bowls_look_dy_m * 100:+.0f} cm Y, "
+#             f"{bowls_look_dz_m * 100:+.0f} cm Z to look at the bowls "
+#             f"{look_bowls_pos.tolist()}"
+#         ),
+#         tol_m=HOME_POS_TOL_M,
+#         timeout_s=5.0,
+#     )
+
+#     base_path = ctx.gemini_response_path
+#     try:
+#         if base_path:
+#             ctx.gemini_response_path = _suffixed_path(base_path, "crack_bowl")
+#         crack_center = gemini.find_bowl_drop_center(
+#             ctx, Object.PASTA_BOWL, retries=retries
+#         )
+#         print(f"[egg_crack:debug] crack bowl (black) center: {crack_center.tolist()}")
+#         if base_path:
+#             ctx.gemini_response_path = _suffixed_path(base_path, "pour_bowl")
+#         pour_center = gemini.find_bowl_drop_center(
+#             ctx, Object.PLASTIC_BOWL_TOP, retries=retries
+#         )
+#         print(f"[egg_crack:debug] pour bowl (plastic) center: {pour_center.tolist()}")
+#     finally:
+#         ctx.gemini_response_path = base_path
+
+#     # Above the crack bowl: same approach waypoint the real cycle uses
+#     # (center + above-center + approach).
+#     above_crack = crack_center + np.array(
+#         [-0.07, -0.05, 0.15],
+#         dtype=np.float64,
+#     )
+#     # crack_precise = gains.apply_precise_grasp(
+#     #     ctx.redis,
+#     #     max_linear_velocity=PRECISE_GRASP_MAX_LINEAR_VELOCITY,
+#     #     max_angular_velocity=PRECISE_GRASP_MAX_ANGULAR_VELOCITY,
+#     #     position_kp=PRECISE_GRASP_POSITION_KP,
+#     #     orientation_kp=PRECISE_GRASP_ORIENTATION_KP,
+#     #     label="egg_crack:debug-above-crack",
+#     # )
+#     arm.move_to(
+#         ctx,
+#         above_crack,
+#         ARM_HOME_ORIENTATION,
+#         label=f"[egg_crack:debug] above crack bowl {above_crack.tolist()} (precise)",
+#         tol_m=DEFAULT_POS_TOL_M,
+#         timeout_s=15.0,
+#     )
+#     # finally:
+#     #     gains.restore_precise_grasp(
+#     #         ctx.redis, crack_precise, label="egg_crack:debug-above-crack"
+#     #     )
+
+#     # Crack the egg into the bowl from the above-crack position, then shake J0
+#     # (the base joint) to dislodge the egg/shell off the cracker fingers (same
+#     # motion as the real cycle, just at the hover pose with no descend).
+#     egg_crack.crack(
+#         ctx,
+#         crack_force=gripper_crack_force,
+#         lift_force=gripper_lift_force,
+#     )
+#     if not no_shake:
+#         _shake_j0_to_dislodge_egg(
+#             ctx,
+#             shake_delta_deg=shake_delta_deg,
+#             shake_cycles=shake_cycles,
+#         )
+#     else:
+#         print("[shake] skipped (--no-shake).")
+
+#     # Release the crack squeeze back to the hold (carry) width so the cracker is
+#     # held at its carry grip again instead of crushed shut for the pour.
+#     crack_spec = OBJECT_DEFAULTS[Object.EGG_CRACKER]
+#     step_gate(
+#         ctx,
+#         f"[egg_crack:debug] release to hold width {crack_spec.close_width:.4f} m "
+#         f"(move-open from the crack squeeze)",
+#     )
+#     gripper.move(
+#         ctx.redis,
+#         crack_spec.close_width,
+#         speed=crack_spec.speed,
+#         force=gripper_lift_force,
+#     )
+#     time.sleep(0.4)
+
+#     # Above the pour bowl: the real pour waypoint (center + above-center). Run
+#     # precise (stiffer cart kp + slower OTG cap) for accurate tracking, then
+#     # restore the normal gains.
+#     above_pour = pour_center + np.array(
+#         [-0.10, 0.0, 0.15], dtype=np.float64
+#     )
+#     # pour_precise = gains.apply_precise_grasp(
+#     #     ctx.redis,
+#     #     max_linear_velocity=PRECISE_GRASP_MAX_LINEAR_VELOCITY,
+#     #     max_angular_velocity=PRECISE_GRASP_MAX_ANGULAR_VELOCITY,
+#     #     position_kp=PRECISE_GRASP_POSITION_KP,
+#     #     orientation_kp=PRECISE_GRASP_ORIENTATION_KP,
+#     #     label="egg_crack:debug-above-pour",
+#     # )
+#     arm.move_to(
+#         ctx,
+#         above_pour,
+#         ARM_HOME_ORIENTATION,
+#         label=f"[egg_crack:debug] above pour bowl {above_pour.tolist()} (precise)",
+#         tol_m=DEFAULT_POS_TOL_M,
+#         timeout_s=3.0,
+#     )
+#     # finally:
+#     #     gains.restore_precise_grasp(
+#     #         ctx.redis, pour_precise, label="egg_crack:debug-above-pour"
+#     #     )
+
+#     # Pour motion (same as the real cycle): tilt the cracker about WORLD +X from
+#     # a clean straight-down base to empty shells out above the pour bowl, then
+#     # right it back. Position is held at the live pour-start pose. The tilt runs
+#     # in precise mode for accurate tracking, restored before righting.
+#     pour_pose = arm.read_current_ee_world(ctx.redis)
+#     if pour_pose is not None:
+#         pour_pos = pour_pose[0]
+#     else:
+#         print(
+#             "[egg_crack:debug] WARNING: live EE pose unavailable at pour start; "
+#             "using commanded above-pour position."
+#         )
+#         pour_pos = above_pour
+
+#     tool_x = ARM_HOME_ORIENTATION[:, 0].astype(np.float64).copy()
+#     tool_x[2] = 0.0
+#     nx = float(np.linalg.norm(tool_x))
+#     tool_x = tool_x / nx if nx > 1e-9 else np.array([1.0, 0.0, 0.0])
+#     tool_z = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+#     tool_y = np.cross(tool_z, tool_x)
+#     tool_y /= np.linalg.norm(tool_y)
+#     straight_down_R = np.column_stack([tool_x, tool_y, tool_z])
+
+#     tilted_ori = arm.pour_orientation_end(
+#         straight_down_R, EGG_CRACK_EMPTY_TILT_DEG, axis="x"
+#     )
+#     # Rise +Z while tilting so the tilted pour pose is up by ..._POUR_TILT_RISE_M,
+#     # then descend back to the original position when righting.
+#     pour_up_pos = pour_pos + np.array(
+#         [0.0, 0.0, EGG_CRACK_POUR_TILT_RISE_M], dtype=np.float64
+#     )
+#     pour_precise = gains.apply_precise_grasp(
+#         ctx.redis,
+#         max_linear_velocity=PRECISE_GRASP_MAX_LINEAR_VELOCITY,
+#         max_angular_velocity=PRECISE_GRASP_MAX_ANGULAR_VELOCITY,
+#         position_kp=PRECISE_GRASP_POSITION_KP,
+#         orientation_kp=PRECISE_GRASP_ORIENTATION_KP,
+#         label="egg_crack:debug-empty-tilt",
+#     )
+#     try:
+#         arm.move_to(
+#             ctx,
+#             pour_up_pos,
+#             tilted_ori,
+#             label=(
+#                 f"[egg_crack:debug] tilt {EGG_CRACK_EMPTY_TILT_DEG:.0f}° about world +X "
+#                 f"+ rise {EGG_CRACK_POUR_TILT_RISE_M * 100:.0f} cm to empty cracker "
+#                 f"(precise mode, straight-down base)"
+#             ),
+#             tol_m=DEFAULT_POS_TOL_M,
+#             timeout_s=PRECISE_GRASP_MOVE_TIMEOUT_S,
+#         )
+#     finally:
+#         gains.restore_precise_grasp(
+#             ctx.redis, pour_precise, label="egg_crack:debug-empty-tilt"
+#         )
+#     arm.move_to(
+#         ctx,
+#         pour_pos,
+#         straight_down_R,
+#         label="[egg_crack:debug] right cracker (back to original position, straight-down)",
+#         tol_m=DEFAULT_POS_TOL_M,
+#     )
+#     print("[egg_crack:debug] complete — detected bowls, cracked + shook, poured.")
+
+
 def main() -> int:
     args = parse_args()
     ctx = make_context(args, step=args.step)
@@ -988,16 +1433,33 @@ def main() -> int:
     ctx.gemini_response_path = args.gemini_response_path
 
     print(f"Step mode      : {'on' if args.step else 'off'}")
+    if args.debug:
+        print("Mode           : DEBUG (bowls-look -> detect bowls -> crack+shake -> pour, no grasp)")
     print(f"Vision         : {'on' if args.vision else 'off'}")
     if args.vision and not args.skip_base:
-        print("Base route     : INGREDIENT_STATION → MIXING_STATION → SINK_STATION")
+        print("Base route     : EGG_CRACK_STATION (three_phase, then arm-only grasp/crack/release)")
     elif args.vision:
         print("Base route     : skipped (--skip-base)")
     print("Carry lift     : 0.0 cm (post-grasp lift skipped — straight to bowl)")
     print(f"Gemini response: {args.gemini_response_path}")
 
     try:
-        if args.vision:
+        if args.debug:
+            pass
+            # run_bowl_debug_cycle(
+            #     ctx,
+            #     skip_base=args.skip_base,
+            #     retries=args.retries,
+            #     bowls_look_dy_m=args.bowls_look_dy_m,
+            #     bowls_look_dz_m=args.bowls_look_dz_m,
+            #     gripper_lift_force=args.gripper_lift_force,
+            #     gripper_crack_force=args.gripper_crack_force,
+            #     shake_delta_deg=args.shake_delta_deg,
+            #     shake_cycles=args.shake_cycles,
+            #     no_shake=args.no_shake,
+            #     gemini_response_path=args.gemini_response_path,
+            # )
+        elif args.vision:
             run_egg_crack_cycle(
                 ctx,
                 skip_base=args.skip_base,
@@ -1015,6 +1477,10 @@ def main() -> int:
                 gemini_response_path=args.gemini_response_path,
                 sink_drop_dz_m=args.sink_drop_dz_m,
                 sink_drop_dx_m=args.sink_drop_dx_m,
+                use_vision_bowls=args.vision_bowls,
+                cracker_look_dy_m=args.cracker_look_dy_m,
+                bowls_look_dy_m=args.bowls_look_dy_m,
+                bowls_look_dz_m=args.bowls_look_dz_m,
             )
         else:
             pick = np.array(

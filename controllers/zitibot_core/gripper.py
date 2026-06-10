@@ -181,6 +181,38 @@ def infer_grasp_success_from_width(
     return width > min_width_m
 
 
+def wait_for_width(
+    redis_client,
+    target_width_m: float,
+    *,
+    tol_m: float = 0.004,
+    timeout_s: float = 3.0,
+    poll_dt_s: float = 0.05,
+) -> float:
+    """Block until ``gripper_current_width`` reaches ``target_width_m`` (±tol).
+
+    Returns the settled finger-gap width in metres. Raises ``TimeoutError`` if
+    the jaws never converge (e.g. MOVE command not executed by the driver).
+    """
+    target = float(target_width_m)
+    deadline = time.perf_counter() + max(timeout_s, 0.0)
+    last: float | None = None
+    while time.perf_counter() < deadline:
+        last = read_current_width(redis_client)
+        if last is not None and last <= target + tol_m:
+            return last
+        time.sleep(poll_dt_s)
+    last = read_current_width(redis_client)
+    msg = (
+        f"gripper finger gap did not reach {target * 100:.1f} cm "
+        f"(tol={tol_m * 100:.1f} cm"
+    )
+    if last is not None:
+        msg += f", last read {last * 100:.1f} cm"
+    msg += ")"
+    raise TimeoutError(msg)
+
+
 def wait_for_grasp_result(
     redis_client,
     *,

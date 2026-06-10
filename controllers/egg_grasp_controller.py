@@ -41,7 +41,7 @@ from zitibot_core import gripper
 from zitibot_core.constants import (
     ARM_HOME_ORIENTATION,
     ARM_HOME_POSITION,
-    EGG_CRACKER_DETECTION_EE_POSITION,
+    DEFAULT_GRIPPER_SPEED,
     OBJECT_DEFAULTS,
     PRECISE_GRASP_MAX_ANGULAR_VELOCITY,
     PRECISE_GRASP_MAX_LINEAR_VELOCITY,
@@ -62,6 +62,16 @@ DEFAULT_GEMINI_RESPONSE_PATH = _CONTROLLERS.parent / "logs" / "gemini_response_e
 # Default grasp force comes straight from the Object.EGG spec's force param.
 EGG_DEFAULT_FORCE_N = float(OBJECT_DEFAULTS[Object.EGG].force)
 
+# Post-release J0 (base) shake to shed the tongs off the open jaws — same
+# pattern/tunables as the egg cracker's post-release shake (small 2° strokes,
+# tight stroke tolerance, no warmup nudge: seed current joints, switch
+# controllers, briefly wait for the swap, then stroke).
+TONGS_RELEASE_SHAKE_DELTA_DEG = 2.0   # per-stroke J0 amplitude
+TONGS_RELEASE_SHAKE_CYCLES = 2        # UP/DOWN J0 cycles
+TONGS_RELEASE_SHAKE_TOL_RAD = 0.0199  # tight: a 2° stroke must actually move
+TONGS_RELEASE_SHAKE_TIMEOUT_S = 0.5
+TONGS_RELEASE_SHAKE_POST_SWITCH_WAIT_S = 0.15
+
 
 # Tongs reach: how far in front of the EE the tong TIPS extend, along the EE's
 # facing direction (its +X, flattened to horizontal -- the yaw). The egg grasp
@@ -80,19 +90,32 @@ TONGS_REACH_M = 0.21
 # Fine-tune with ``--tong-yaw-offset-deg`` if the tips land to one side.
 TONGS_EE_X_YAW_BIAS_DEG = 35.0
 
+# Clamp on the commanded wrist yaw (deg, about world +Z, relative to the home
+# wrist orientation) when aiming the tongs at the egg. The detected egg bearing
+# can push the wrist to awkward/unreachable yaws; we limit the EE so it only
+# ever sits between -15 deg and +45 deg around Z. When the clamp engages, the
+# EE backoff direction is recomputed from the clamped yaw so the standoff still
+# matches where the tongs actually point.
+EGG_GRASP_YAW_MIN_DEG = -15.0
+EGG_GRASP_YAW_MAX_DEG = 45.0
+
 # Straight-up lift (m) after setting the tongs back down and opening, so the
 # gripper clears the released tongs before returning home.
 TONGS_RETURN_LIFT_M = 0.05
+
+# Loose 5 cm clearance lift inserted after each pick/release so the arm
+# reliably clears the table/object before the next move, WITHOUT burning time
+# converging precisely. NOTE: the tolerance must stay BELOW the lift distance —
+# arm.move_to converges on "within tol AND settled", so a tolerance >= the lift
+# would let the move finish immediately (already within tol, already stopped)
+# and the arm wouldn't lift at all.
+CLEARANCE_LIFT_M = 0.05
+CLEARANCE_LIFT_TOL_M = 0.03
 
 # Shift the egg-release target (over the cracker cradle) back this far in world
 # -X. Applied to the EE XY so BOTH the above-cradle approach and the final
 # release/lower poses move back together.
 CRACKER_RELEASE_X_BACK_M = 0.00
-
-# Straight-up lift (m) after the tongs force-close on the egg, so the egg
-# clears the table before transiting to the cracker cradle (no home waypoint
-# in between -- just this lift).
-EGG_TONGS_CARRY_LIFT_M = 0.10
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,25 +147,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
-        "--tongs-egg",
-        dest="tongs_egg",
-        action="store_true",
-        default=True,
-        help=(
-            "Tongs+egg cycle (DEFAULT): from home, Gemini-detect and grab the "
-            "tongs (two red tapes), lift back to home, Gemini-detect the egg, "
-            "position the tong tips on it (EE = egg - tongs reach along tool "
-            "+Z), and force-close to pick the egg up with the tongs. Ends with "
-            "the egg held in the tongs."
-        ),
-    )
-    p.add_argument(
-        "--no-tongs-egg",
-        dest="tongs_egg",
-        action="store_false",
-        help="Run the plain single-egg grasp (detect + grab one egg) instead of the tongs+egg flow.",
-    )
-    p.add_argument(
         "--tongs-reach-cm",
         type=float,
         default=TONGS_REACH_M * 100.0,
@@ -152,26 +156,6 @@ def parse_args() -> argparse.Namespace:
             "back from the detected egg along that axis so the tongs reach "
             "forward onto it. Default 19.05 cm (7.5 in)."
         ),
-    )
-
-    # Detection-pose override. Defaults to the egg-cracker camera framing pose.
-    p.add_argument(
-        "--detection-x",
-        type=float,
-        default=float(EGG_CRACKER_DETECTION_EE_POSITION[0]),
-        help="Camera-framing EE X for Gemini detection.",
-    )
-    p.add_argument(
-        "--detection-y",
-        type=float,
-        default=float(EGG_CRACKER_DETECTION_EE_POSITION[1]),
-        help="Camera-framing EE Y for Gemini detection.",
-    )
-    p.add_argument(
-        "--detection-z",
-        type=float,
-        default=float(EGG_CRACKER_DETECTION_EE_POSITION[2]),
-        help="Camera-framing EE Z for Gemini detection.",
     )
 
     # Grasp tunables.
@@ -294,6 +278,36 @@ def _suffixed_path(base: str | Path, suffix: str) -> str:
     return str(p.with_name(f"{p.stem}_{suffix}{p.suffix}"))
 
 
+def _clearance_lift(
+    ctx: TaskContext,
+    *,
+    dz_m: float = CLEARANCE_LIFT_M,
+    tol_m: float = CLEARANCE_LIFT_TOL_M,
+    label: str = "[arm] clearance lift",
+) -> None:
+    """Lift straight up ``dz_m`` from the CURRENT EE pose with a loose tolerance.
+
+    Reads the live EE pose so it's relative to wherever the arm just finished,
+    keeps the current wrist orientation, and uses a loose (but < ``dz_m``)
+    tolerance so the move clears quickly without precise convergence.
+    """
+    pose = arm.read_current_ee_world(ctx.redis)
+    if pose is None:
+        print(f"{label}: EE pose unavailable; skipping clearance lift.")
+        return
+    cur_pos, cur_ori = pose
+    lift = np.asarray(cur_pos, dtype=np.float64).reshape(3) + np.array(
+        [0.0, 0.0, float(dz_m)], dtype=np.float64
+    )
+    arm.move_to(
+        ctx,
+        lift,
+        cur_ori,
+        label=f"{label} +{dz_m * 100:.0f} cm -> {lift.tolist()}",
+        tol_m=float(tol_m),
+    )
+
+
 def _cradle_response_path(base: str | Path) -> str:
     """Dedicated save path for the cradle-CENTER detection overlay.
 
@@ -307,7 +321,11 @@ def _cradle_response_path(base: str | Path) -> str:
 
 
 def _aim_tongs_at(
-    point: np.ndarray, *, yaw_offset_deg: float = 0.0
+    point: np.ndarray,
+    *,
+    yaw_offset_deg: float = 0.0,
+    yaw_min_deg: float = EGG_GRASP_YAW_MIN_DEG,
+    yaw_max_deg: float = EGG_GRASP_YAW_MAX_DEG,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Yaw the home wrist so the *held tongs* aim horizontally at ``point``.
 
@@ -332,7 +350,7 @@ def _aim_tongs_at(
     home_R = np.asarray(ARM_HOME_ORIENTATION, dtype=np.float64)
     aim = np.asarray(point, dtype=np.float64).reshape(3) - ARM_HOME_POSITION
     aim[2] = 0.0  # horizontal bearing only (yaw)
-    reach_hat = aim / np.linalg.norm(aim)
+    aim_hat = aim / np.linalg.norm(aim)
     home_x = home_R[:, 0].copy()
     home_x[2] = 0.0
     home_x /= np.linalg.norm(home_x)
@@ -340,102 +358,38 @@ def _aim_tongs_at(
     # carries flange +X exactly onto the aim; subtract the tong/flange bias so
     # the *tongs* (flange +X + bias) end up on the aim instead.
     dyaw = float(np.arctan2(
-        home_x[0] * reach_hat[1] - home_x[1] * reach_hat[0],  # cross_z
-        float(np.dot(home_x, reach_hat)),                      # dot
+        home_x[0] * aim_hat[1] - home_x[1] * aim_hat[0],  # cross_z
+        float(np.dot(home_x, aim_hat)),                    # dot
     ))
     cmd_yaw = dyaw - np.radians(float(yaw_offset_deg))
+    # Clamp the EE yaw so the wrist only sits within [yaw_min, yaw_max] about
+    # world +Z (relative to home). The detected bearing can otherwise push the
+    # wrist to awkward yaws.
+    cmd_yaw_clamped = float(
+        np.clip(cmd_yaw, np.radians(float(yaw_min_deg)), np.radians(float(yaw_max_deg)))
+    )
+    if cmd_yaw_clamped != cmd_yaw:
+        print(
+            f"[egg] wrist yaw clamped {np.degrees(cmd_yaw):+.1f} -> "
+            f"{np.degrees(cmd_yaw_clamped):+.1f} deg "
+            f"(limit [{yaw_min_deg:+.1f}, {yaw_max_deg:+.1f}])"
+        )
+    cmd_yaw = cmd_yaw_clamped
     c, s = float(np.cos(cmd_yaw)), float(np.sin(cmd_yaw))
     r_z = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
     hold_R = r_z @ home_R
+    # Backoff direction = where the tongs actually point after the (possibly
+    # clamped) yaw: flange +X rotated by (cmd_yaw + bias). When unclamped this
+    # equals the true aim (cmd_yaw + bias == dyaw), so the standoff stays
+    # consistent with the wrist orientation in all cases.
+    tong_yaw = cmd_yaw + np.radians(float(yaw_offset_deg))
+    ct, st = float(np.cos(tong_yaw)), float(np.sin(tong_yaw))
+    reach_hat = np.array(
+        [ct * home_x[0] - st * home_x[1], st * home_x[0] + ct * home_x[1], 0.0],
+        dtype=np.float64,
+    )
+    reach_hat /= np.linalg.norm(reach_hat)
     return reach_hat, hold_R, cmd_yaw
-
-
-def _vision_pick_pose(
-    ctx: TaskContext,
-    *,
-    skip_base: bool,
-    detection_xyz: tuple[float, float, float],
-    retries: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Home → (base) → Gemini egg point (from home). Returns (pick_pos, grip_R).
-
-    Detection happens straight from the home pose — no separate camera-framing
-    detection-pose move.
-    """
-    _ = detection_xyz  # detection pose skipped; kept for signature compatibility
-    arm.move_to(
-        ctx,
-        ARM_HOME_POSITION,
-        ARM_HOME_ORIENTATION,
-        label=f"[arm] move to home {ARM_HOME_POSITION.tolist()} (Gemini detects from home)",
-        tol_m=HOME_POS_TOL_M,
-    )
-
-    # Recentering detection: if Gemini sees the egg but the grasp can't be
-    # built (e.g. depth rejected by the 20 cm floor), the EE is nudged to bring
-    # the egg toward the frame center and the detection is retried. Orientation
-    # is held at home so the camera only translates.
-    pose = gemini.find_grasp_pose_recentering(
-        ctx,
-        Object.EGG,
-        retries=retries,
-        hold_orientation=ARM_HOME_ORIENTATION,
-    )
-    pick_pos = pose.position.astype(np.float64, copy=True)
-    grip_R = pose.orientation
-    print(f"[egg] detected grasp: {pick_pos.tolist()}")
-    return pick_pos, grip_R
-
-
-def run_egg_grasp_cycle(
-    ctx: TaskContext,
-    *,
-    skip_base: bool = False,
-    gripper_speed: float = 0.02,
-    close_width: float = 0.045,
-    gripper_force: float = EGG_DEFAULT_FORCE_N,
-    retries: int = 1,
-    detection_xyz: tuple[float, float, float] | None = None,
-    gemini_response_path: str | None = None,
-) -> None:
-    """Detect the egg, force-grasp it tool-down at a gentle force, then go home."""
-    if gemini_response_path is not None:
-        ctx.gemini_response_path = gemini_response_path
-    if ctx.gemini_response_path is None:
-        ctx.gemini_response_path = str(DEFAULT_GEMINI_RESPONSE_PATH)
-    if detection_xyz is None:
-        detection_xyz = tuple(float(v) for v in EGG_CRACKER_DETECTION_EE_POSITION)
-
-    pick, grip_R = _vision_pick_pose(
-        ctx,
-        skip_base=skip_base,
-        detection_xyz=detection_xyz,
-        retries=retries,
-    )
-
-    # Force close (GRASP mode): jaws force-close on the egg at spec.force.
-    gripper.wait_for_ready(ctx.redis)
-    spec = OBJECT_DEFAULTS[Object.EGG]
-    spec.speed = float(gripper_speed)
-    spec.close_width = float(close_width)
-    spec.force = float(gripper_force)
-
-    grasp.object(
-        ctx,
-        Object.EGG,
-        pick_pos=pick,
-        ori=grip_R,
-        lift_dz_m=0.0,
-        close_mode="grasp",
-    )
-    arm.move_to(
-        ctx,
-        ARM_HOME_POSITION,
-        ARM_HOME_ORIENTATION,
-        label=f"[egg] back to home {ARM_HOME_POSITION.tolist()} (egg held)",
-        tol_m=HOME_POS_TOL_M,
-    )
-    print("[egg] grasp complete - back at home.")
 
 
 def _release_egg_into_cracker(
@@ -468,17 +422,19 @@ def _release_egg_into_cracker(
     else:
         cracker = np.asarray(cradle, dtype=np.float64).reshape(3)
         print(f"[cracker] using pre-detected cradle center: {cracker.tolist()}")
+    
+    cracker_pos = cracker + np.array([-0.02, -0.02, 0.00], dtype=np.float64)
 
-    reach_hat, hold_R, cmd_yaw = _aim_tongs_at(cracker, yaw_offset_deg=tong_yaw_offset_deg)
+    reach_hat, hold_R, cmd_yaw = _aim_tongs_at(cracker_pos, yaw_offset_deg=tong_yaw_offset_deg)
     # EE XY so the tong tips (tongs_reach_m out along the aim) sit over the
     # cradle center; EE Z is set per phase so the TIPS land at the wanted
     # height above the cradle.
-    ee_xy = cracker - float(tongs_reach_m) * reach_hat
+    ee_xy = cracker_pos - float(tongs_reach_m) * reach_hat
     # Nudge the EE XY back in world -X so the approach + release sit 2 cm
     # behind the detected cradle center.
     ee_xy = ee_xy + np.array([-CRACKER_RELEASE_X_BACK_M, 0.0, 0.0], dtype=np.float64)
-    above = np.array([ee_xy[0], ee_xy[1], cracker[2] + float(above_dz_m)], dtype=np.float64)
-    low = np.array([ee_xy[0], ee_xy[1], cracker[2] + float(release_dz_m)], dtype=np.float64)
+    above = np.array([ee_xy[0], ee_xy[1], cracker_pos[2] + float(above_dz_m)], dtype=np.float64)
+    low = np.array([ee_xy[0], ee_xy[1], cracker_pos[2] + float(release_dz_m)], dtype=np.float64)
     print(
         f"[cracker] tips over cradle along aim "
         f"[{reach_hat[0]:+.3f}, {reach_hat[1]:+.3f}, {reach_hat[2]:+.3f}] "
@@ -509,7 +465,7 @@ def _release_egg_into_cracker(
             low,
             hold_R,
             label=f"[cracker] lower to {release_dz_m * 100:.1f} cm above cradle {low.tolist()}",
-            tol_m=0.03,
+            tol_m=0.01,
             timeout_s=6.0,
         )
         step_gate(
@@ -522,13 +478,9 @@ def _release_egg_into_cracker(
         # Restore normal stiffness/speed before retreating.
         gains.restore_precise_grasp(ctx.redis, snap, label="cracker-release")
 
-    arm.move_to(
-        ctx,
-        ARM_HOME_POSITION,
-        ARM_HOME_ORIENTATION,
-        label=f"[cracker] back to home {ARM_HOME_POSITION.tolist()} (egg released, tongs held)",
-        tol_m=HOME_POS_TOL_M,
-    )
+    # Retreat straight up from the release pose (keep wrist orientation) rather
+    # than driving all the way back to home. Loose 5 cm clearance lift.
+    _clearance_lift(ctx, label="[cracker] lift after egg release (egg released, tongs held)")
     print("[cracker] complete - egg released into the cracker, tongs still held.")
 
 
@@ -549,7 +501,13 @@ def _return_tongs(
     """
     pick_pos = np.asarray(pick_pos, dtype=np.float64).reshape(3)
     pick_ori = np.asarray(pick_ori, dtype=np.float64).reshape(3, 3)
-
+    arm.move_to(
+        ctx,
+        pick_pos + np.array([0.00, 0.00, 0.10], dtype=np.float64),
+        pick_ori,
+        label=f"[tongs] return to pickup pose {pick_pos.tolist()}",
+        tol_m=HOME_POS_TOL_M,
+    )
     arm.move_to(
         ctx,
         pick_pos,
@@ -557,20 +515,26 @@ def _return_tongs(
         label=f"[tongs] return to pickup pose {pick_pos.tolist()}",
         tol_m=HOME_POS_TOL_M,
     )
-    step_gate(ctx, "[tongs] release tongs (open gripper to full width)")
-    open_w = gripper.open_gripper(ctx.redis, None, speed=float(gripper_speed), force=40.0)
+    step_gate(ctx, "[tongs] release tongs (open gripper to full width, full speed)")
+    open_w = gripper.open_gripper(
+        ctx.redis,
+        None,
+        speed=DEFAULT_GRIPPER_SPEED,
+        force=40.0,
+        use_max_mode=True,
+    )
     print(f"[tongs] opened to {open_w:.4f} m to release the tongs")
-    time.sleep(1.0)
+    time.sleep(2.0)
 
-    lift = pick_pos.copy()
-    lift[2] += float(lift_dz_m)
+    pick_lift = pick_pos + np.array([0.00, 0.00, 0.08], dtype=np.float64)
     arm.move_to(
         ctx,
-        lift,
+        pick_lift,
         pick_ori,
-        label=f"[tongs] lift straight up {lift.tolist()}",
+        label=f"[tongs] lift straight up {pick_lift.tolist()}",
         tol_m=HOME_POS_TOL_M,
     )
+
     arm.move_to(
         ctx,
         ARM_HOME_POSITION,
@@ -612,8 +576,8 @@ def run_tongs_egg_cycle(
        ``keep_grip=True`` so the tongs aren't dropped) descends and MOVE-closes
        to ``egg_close_width`` (no squeeze), then FORCE-closes (``egg_force``)
        to secure the egg.
-    5. Lift the egg straight up by ``EGG_TONGS_CARRY_LIFT_M`` to clear the
-       table (no home waypoint).
+    5. Lift the egg straight up ``CLEARANCE_LIFT_M`` to clear the table (no
+       home waypoint).
     6. If ``release_into_cracker``: carry the egg straight over the
        PRE-DETECTED cradle center, the wrist yaws so the tong tips reach over
        it, the arm moves a bit above then (precise mode) lowers to
@@ -638,7 +602,7 @@ def run_tongs_egg_cycle(
         tol_m=HOME_POS_TOL_M,
     )
     if not skip_base:
-        base.go_to_pose(ctx, BaseWaypoint.INGREDIENT_STATION)
+        base.go_to_pose(ctx, BaseWaypoint.EGG_CRACK_STATION)
 
     # 2. Detect ALL THREE targets up front from the home view (empty gripper,
     # nothing occluding): the tongs grasp, the egg grasp, and the egg-cracker
@@ -690,6 +654,9 @@ def run_tongs_egg_cycle(
         close_mode="move",
         lift_tol_m=HOME_POS_TOL_M,
     )
+    # 5 cm loose clearance lift so the tongs clear the table before swinging
+    # over toward the egg.
+    _clearance_lift(ctx, label="[tongs] clearance lift after pickup")
 
     # 4. Aim the tool at the egg, then back off along that aim. The tongs come
     # out of the EE's +X, so we YAW the wrist about world +Z until the EE's +X
@@ -735,18 +702,8 @@ def run_tongs_egg_cycle(
         print("[tongs+egg] WARNING: force-close reported no object held.")
 
     # 5. Lift the egg straight up to clear the table — no home waypoint, the
-    # release step carries it straight over to the cradle.
-    egg_lift = target + np.array([0.0, 0.0, EGG_TONGS_CARRY_LIFT_M], dtype=np.float64)
-    arm.move_to(
-        ctx,
-        egg_lift,
-        hold_R,
-        label=(
-            f"[tongs+egg] lift egg {EGG_TONGS_CARRY_LIFT_M * 100:.0f} cm "
-            f"straight up {egg_lift.tolist()}"
-        ),
-        tol_m=HOME_POS_TOL_M,
-    )
+    # release step carries it straight over to the cradle. Loose 5 cm clearance.
+    _clearance_lift(ctx, label="[tongs+egg] clearance lift after egg pickup")
     print("[tongs+egg] egg secured in the tongs.")
 
     # 6. Carry the egg over the pre-detected cracker cradle and drop it in
@@ -837,7 +794,7 @@ def main() -> int:
     print(f"Step mode      : {'on' if args.step else 'off'}")
     if args.debug:
         print("Mode           : DEBUG (home -> open -> force-close, no base/Gemini/lift)")
-    elif args.tongs_egg:
+    else:
         print("Mode           : TONGS+EGG (grab tongs -> pick egg with tongs)")
         print(f"Base move      : {'skipped (--skip-base)' if args.skip_base else 'INGREDIENT_STATION only'}")
         print(f"Tongs reach    : {args.tongs_reach_cm:.1f} cm (EE yaw +X, in front of EE)")
@@ -849,8 +806,6 @@ def main() -> int:
             )
         else:
             print("Cracker drop   : off (--no-release-into-cracker)")
-    else:
-        print(f"Base move      : {'skipped (--skip-base)' if args.skip_base else 'INGREDIENT_STATION only'}")
     print(
         f"Gripper        : force={args.gripper_force:.1f} N  "
         f"close-width={args.close_width * 100:.1f} cm  "
@@ -867,7 +822,7 @@ def main() -> int:
                 close_width=args.close_width,
                 gripper_force=args.gripper_force,
             )
-        elif args.tongs_egg:
+        else:
             run_tongs_egg_cycle(
                 ctx,
                 skip_base=args.skip_base,
@@ -881,17 +836,6 @@ def main() -> int:
                 release_width=args.release_width,
                 cracker_above_m=args.cracker_above_cm / 100.0,
                 cracker_release_m=args.cracker_release_cm / 100.0,
-                gemini_response_path=args.gemini_response_path,
-            )
-        else:
-            run_egg_grasp_cycle(
-                ctx,
-                skip_base=args.skip_base,
-                gripper_speed=args.gripper_speed,
-                close_width=args.close_width,
-                gripper_force=args.gripper_force,
-                retries=args.retries,
-                detection_xyz=(args.detection_x, args.detection_y, args.detection_z),
                 gemini_response_path=args.gemini_response_path,
             )
     except KeyboardInterrupt:

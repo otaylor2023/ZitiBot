@@ -15,6 +15,7 @@ from vision import gemini_pointing as gp
 from zitibot_core import arm
 from zitibot_core.constants import (
     EE_ORI_TOOL_DOWN,
+    EGG_CRACKER_CRADLE_CENTER_WORLD_OFFSET_M,
     OBJECT_DEFAULTS,
     PAN_STATION_GRASP_EE_ORIENTATION,
     T_FLANGE_CAMERA,
@@ -102,6 +103,7 @@ _GEMINI_LOGS_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
 GEMINI_GRASP_RESPONSE_PATHS: dict[Object, Path] = {
     Object.PAN: _GEMINI_LOGS_DIR / "gemini_response_pan.png",
     Object.MIXING_BOWL: _GEMINI_LOGS_DIR / "gemini_response_mixing_bowl_grasp.png",
+    Object.WHISK: _GEMINI_LOGS_DIR / "gemini_response_whisk_grasp.png",
 }
 
 
@@ -508,6 +510,65 @@ def _egg_cracker_blue_prompt(o: Object) -> str:
     )
 
 
+# Minimum depth (m) for ladle grasp: reject foreground gripper / wrist returns
+# (~5–7 cm) while keeping valid counter-top ladle hits (~10–15 cm+).
+LADLE_MIN_DEPTH_M = 0.08
+
+
+# Minimum depth (m) for whisk grasp: reject foreground gripper returns while
+# keeping valid counter-top hits (~10–15 cm+).
+WHISK_MIN_DEPTH_M = 0.08
+
+
+def _whisk_blue_plaster_prompt(o: Object) -> str:
+    """Whisk: one point on the blue plaster/tape patch (pick-up grasp location)."""
+    return (
+        f"In the image, locate a **kitchen whisk** resting on the table/counter. "
+        f"The whisk handle has a patch of **BLUE plaster** (or blue tape/marker) "
+        f"— that blue patch is the ONLY valid grasp target for this step. "
+        f"Do NOT pick the red tape, the wire loops/ball, the table, or the robot "
+        f"gripper.\n"
+        f"\n"
+        f"Return ONE point at the **center** of the blue plaster/tape patch. "
+        f"The point must sit on visibly BLUE pixels.\n"
+        f"\n"
+        f"Reply with JSON only:\n"
+        f'[{{"point": [y, x], "label": "{o.value}_blue_plaster"}}]\n'
+        f"Coordinates must be normalized 0-1000 in [y, x] order."
+    )
+
+
+def _whisk_red_tape_prompt(o: Object) -> str:
+    """Whisk: two points on the top portion of the red tape, at opposite ends
+    along the tape's long edge (handle axis). Midpoint = grasp target.
+    """
+    return (
+        f"In the image, locate a **kitchen whisk** (it may be sitting in a bowl "
+        f"on the table/counter). The whisk has a metal handle with a short strip "
+        f"of **RED tape** wrapped around it — that red tape is the ONLY valid "
+        f"grasp target. Do NOT pick the wire loops/ball at the far end, the "
+        f"table/bowl rim, or the robot gripper.\n"
+        f"\n"
+        f"Return TWO distinct points on the **top portion** of the red tape strip "
+        f"— the upper half / top long edge of the tape patch (the side of the "
+        f"tape facing upward toward the camera), NOT the bottom edge of the tape "
+        f"and NOT on bare handle metal below the tape. Place the points at "
+        f"opposite ends along the tape's **longer side** (lengthwise along the "
+        f"handle axis, NOT across the short width). Both points must sit on "
+        f"visibly RED tape pixels on that top portion.\n"
+        f"\n"
+        f"The midpoint of the two points is the grasp target (it must land on the "
+        f"top portion of the red tape); the line between them defines the handle "
+        f"axis (the gripper closes perpendicular to this axis, wrapping around "
+        f"the handle).\n"
+        f"\n"
+        f"Reply with JSON only:\n"
+        f'[{{"point": [y, x], "label": "{o.value}_tape_1"}}, '
+        f'{{"point": [y, x], "label": "{o.value}_tape_2"}}]\n'
+        f"Coordinates must be normalized 0-1000 in [y, x] order."
+    )
+
+
 def _tongs_red_tape_prompt(o: Object) -> str:
     """Tongs: one point on each of the two RED tape marks (one per arm).
 
@@ -552,25 +613,17 @@ EGG_DEPTH_PATCH_RADIUS = 12
 # than 20 cm so near-field noise off the shell / the gripper's own fingers
 # can't pull the grasp Z toward the camera.
 EGG_MIN_DEPTH_M = 0.20
-# Egg detections should be on the table/work surface. If Gemini lands on the
-# tongs or a depth hole, RealSense can jump to the far background and produce
-# unreachable poses (e.g. world Z meters below the table). Treat those as a
-# detection miss so the recenter-and-retry path can recover.
-EGG_MAX_DEPTH_M = 0.80
-EGG_WORLD_Z_MIN_M = 0.15
-# The egg sits on the table (world z ~ 0.33 m). The empty tongs are held up in
-# the air during egg detection (~0.5 m), so cap the accepted world z below that
-# to reject detections that land on the held tongs instead of the egg.
-EGG_WORLD_Z_MAX_M = 0.45
 
 
 def _egg_prompt(o: Object) -> str:
     return (
-        f"In the image, locate the **egg** (a single whole chicken egg resting "
-        f"on the surface). Choose ONE point at the center of the top of the egg "
-        f"— the highest, most central spot where a gripper coming straight down "
+        f"In the image, locate the **egg(s)** (whole chicken eggs resting on the "
+        f"surface). There may be ONE or TWO eggs visible. If there are two, pick "
+        f"the CLOSEST one — the egg LOWEST in the image (largest y, nearest the "
+        f"bottom edge). Choose ONE point at the center of the top of that egg — "
+        f"the highest, most central spot where a gripper coming straight down "
         f"from above should grasp it.\n"
-        f"Reply with JSON only:\n"
+        f"Reply with JSON only, a single point for the chosen egg:\n"
         f'[{{"point": [y, x], "label": "{o.value}"}}]\n'
         f"Coordinates must be normalized 0-1000 in [y, x] order."
     )
@@ -609,10 +662,46 @@ _PROMPTS: dict[tuple[Object, str], _Detection] = {
         # Rim grasp: keep the legacy shallowest-in-patch depth rule.
         prefer_gemini_pixel_depth=False,
     ),
+    (Object.PASTA_BOWL, "center"): _Detection(
+        prompt=lambda o: (
+            "In the image, locate the **center** of the **black pasta bowl** "
+            "interior — the dark/black bowl where egg contents should land. "
+            "Do NOT pick the white plastic bowl, the table outside the bowl, "
+            "or the bowl rim.\n"
+            "Pick the geometric CENTER of the bowl's circular opening even if "
+            "there are objects/contents inside it (eggs, shells, food, etc.) — "
+            "report the center point of the BOWL itself, not of anything sitting "
+            "inside it. If the exact center is occluded, still report where the "
+            "bowl's center is.\n"
+            "Reply with JSON only:\n"
+            f'[{{"point": [y, x], "label": "{o.value}_center"}}]\n'
+            "Coordinates must be normalized 0-1000 in [y, x] order."
+        ),
+        select="first",
+        world_offset_m=np.zeros(3, dtype=np.float64),
+    ),
     (Object.PLASTIC_BOWL_TOP, "grasp"): _Detection(
         prompt=_plastic_bowl_left_edge_prompt,
         select="midpoint",
         prefer_gemini_pixel_depth=False,
+    ),
+    (Object.PLASTIC_BOWL_TOP, "center"): _Detection(
+        prompt=lambda o: (
+            "In the image, locate the **center** of the **white plastic bowl** "
+            "interior — the light-colored/white bowl used for shells and scraps. "
+            "Do NOT pick the black pasta bowl, the table outside the bowl, "
+            "or the bowl rim.\n"
+            "Pick the geometric CENTER of the bowl's circular opening even if "
+            "there are objects/contents inside it (shells, scraps, food, etc.) — "
+            "report the center point of the BOWL itself, not of anything sitting "
+            "inside it. If the exact center is occluded, still report where the "
+            "bowl's center is.\n"
+            "Reply with JSON only:\n"
+            f'[{{"point": [y, x], "label": "{o.value}_center"}}]\n'
+            "Coordinates must be normalized 0-1000 in [y, x] order."
+        ),
+        select="first",
+        world_offset_m=np.zeros(3, dtype=np.float64),
     ),
     (Object.PLASTIC_BOWL_BOTTOM, "grasp"): _Detection(
         prompt=_plastic_bowl_left_edge_prompt,
@@ -654,24 +743,80 @@ _PROMPTS: dict[tuple[Object, str], _Detection] = {
             f"Coordinates must be normalized 0-1000 in [y, x] order."
         ),
         select="first",
+        # Return the raw pan-floor center in world frame. (The PAN spec's
+        # ``gemini_world_offset_m`` is tuned for the HANDLE grasp, not the
+        # cooking-surface center, so don't inherit it here.) Callers add
+        # their own work-height offset above this point.
+        world_offset_m=np.zeros(3, dtype=np.float64),
+    ),
+    (Object.PAN, "center_rim"): _Detection(
+        prompt=lambda o: (
+            f"In the image, locate the **{o.value}** (round metal frying/cooking "
+            f"pan). Find the FULL pan: it is the big circular METAL pan body — "
+            f"the dark/grey metal disc with a raised circular metal rim/lip "
+            f"around its outer edge. The pan usually has a handle sticking out "
+            f"to one side; the round metal part is the pan.\n"
+            f"CRITICAL: the pan may be PARTLY FILLED with food (a yellow/orange "
+            f"egg puddle, batter, or other ingredients) sitting in the middle. "
+            f"That food puddle is SMALLER than the pan and is NOT the pan. IGNORE "
+            f"the food: do NOT treat the edge of the egg/food as the rim, and do "
+            f"NOT put either point on or just around the food. Use the OUTER "
+            f"METAL circle of the pan itself, which extends well BEYOND the food "
+            f"to the actual metal lip.\n"
+            f"Return EXACTLY TWO points as a JSON array, in this EXACT order. "
+            f"The two points are DIFFERENT and must be FAR apart:\n"
+            f"  1. CENTER — the geometric dead center of the whole round METAL "
+            f"pan (the bullseye, equidistant from the OUTER METAL rim on all "
+            f"sides). Estimate the center of the full metal circle even if food "
+            f"covers part of it.\n"
+            f"  2. RIM — a point right ON the pan's OUTER METAL rim: the raised "
+            f"circular lip at the outermost boundary of the metal pan, where the "
+            f"metal curves up into the side wall. Put it AS FAR FROM THE CENTER "
+            f"AS POSSIBLE while still on the metal pan rim (NOT on the food, NOT "
+            f"partway across the floor, NOT on the handle, NOT on the stove "
+            f"outside the pan).\n"
+            f"So point 1 is in the middle and point 2 is out at the far metal "
+            f"edge; the distance between them is the pan's true radius and should "
+            f"be clearly LARGER than the food puddle's radius.\n"
+            f"Reply with JSON only:\n"
+            f'[{{"point": [y, x], "label": "{o.value}_center"}}, '
+            f'{{"point": [y, x], "label": "{o.value}_rim"}}]\n'
+            f"Coordinates must be normalized 0-1000 in [y, x] order."
+        ),
+        # Raw points in world frame (radius is computed from their separation;
+        # the caller adds its own work-height offset to the center).
+        world_offset_m=np.zeros(3, dtype=np.float64),
     ),
     (Object.LADLE, "grasp"): _Detection(
         prompt=lambda o: (
-            f"In the image, locate the **black tape mark** on the tongs attached to the ladle. "
-            f"The setup is: a ladle standing upright (bowl touching the table) with a pair of black "
-            f"plastic tongs zip-tied to its handle. There is a short strip of black tape near the "
-            f"free end of the tongs (the end away from the ladle bowl) — this tape mark is the grasp target. "
-            f"Choose TWO distinct points along the tongs' long axis, both within the tape mark region, "
-            f"so that their midpoint is the grasp target and the line between them defines the tong axis "
-            f"(the gripper will close perpendicular to this axis).\n"
+            f"IMPORTANT — IGNORE THE ROBOT: The image may show the robot's own "
+            f"white/grey Franka gripper fingers, wrist, or zip-ties in the "
+            f"FOREGROUND (often along the bottom edge of the image, very close "
+            f"to the camera). Do NOT pick any point on the robot, the gripper, "
+            f"the camera mount, or anything attached to the robot arm.\n"
+            f"\n"
+            f"Find the **ladle** standing on the table/counter: a metal ladle "
+            f"with its bowl resting on the surface and its handle pointing "
+            f"upward. A pair of black plastic kitchen tongs is zip-tied to the "
+            f"ladle handle. On those tongs (toward the free end, farthest from "
+            f"the ladle bowl) there is a short strip of **BLUE tape** (blue "
+            f"plaster / blue marker) — that BLUE strip on the LADLE's tongs is "
+            f"the ONLY valid grasp target. Ignore any black tape, plain metal, "
+            f"or other coloured marks.\n"
+            f"\n"
+            f"Choose TWO distinct points along the tongs' long axis, both within "
+            f"that BLUE strip on the ladle (not on the pan, not on the stove, "
+            f"not on the robot), so that their midpoint is the grasp target and "
+            f"the line between them defines the tong axis (the gripper will "
+            f"close perpendicular to this axis).\n"
             f"Reply with JSON only:\n"
-            f'[{{"point": [y, x], "label": "{o.value}_tong_tape_1"}}, '
-            f'{{"point": [y, x], "label": "{o.value}_tong_tape_2"}}]\n'
+            f'[{{"point": [y, x], "label": "{o.value}_blue_strip_1"}}, '
+            f'{{"point": [y, x], "label": "{o.value}_blue_strip_2"}}]\n'
             f"Coordinates must be normalized 0-1000 in [y, x] order."
         ),
         select="midpoint",
-        # Cylinder/handle rim grasp: keep the legacy shallowest-in-patch rule.
-        prefer_gemini_pixel_depth=False,
+        prefer_gemini_pixel_depth=True,
+        min_depth_m=LADLE_MIN_DEPTH_M,
     ),
     (Object.LADLE, "handle"): _Detection(
         prompt=lambda o: (
@@ -687,17 +832,22 @@ _PROMPTS: dict[tuple[Object, str], _Detection] = {
             f"In the image, locate the handle of the **{o.value}**. "
             f"Return TWO points that lie ALONG the handle's long axis "
             f"(the line running from where the handle meets the pan body "
-            f"outward toward the handle tip):\n"
+            f"outward toward the handle tip). The two points define the handle "
+            f"DIRECTION, so spread them as FAR APART as possible along the "
+            f"handle's length to give an accurate axis:\n"
             f"  - Point 1 (GRASP point): on the SOLID, thick part of the "
             f"handle, just outside where it joins the pan body. Must be on "
             f"actual handle material — not on the pan body itself and not "
             f"in any gap, slot, or cutout.\n"
-            f"  - Point 2 (AXIS point): a few centimetres further along the "
-            f"handle toward the tip, also on the solid handle centerline.\n"
+            f"  - Point 2 (TIP point): at the FAR END of the handle, on the "
+            f"solid handle centerline as close to the very tip as possible "
+            f"(NOT a few cm from point 1 — go all the way out to the end so "
+            f"the line between the two points spans the full visible handle).\n"
             f"\n"
             f"Both points must sit on the handle's centerline (front-to-back, "
-            f"running lengthwise). The line from point 1 to point 2 should "
-            f"run ALONG the handle's length, not across its width.\n"
+            f"running lengthwise). The line from point 1 to point 2 must run "
+            f"ALONG the handle's length, NOT across its width, and should be as "
+            f"long as the handle itself.\n"
             f"\n"
             f"Reply with JSON only:\n"
             f'[{{"point": [y, x], "label": "{o.value}_handle_grasp"}}, '
@@ -707,8 +857,32 @@ _PROMPTS: dict[tuple[Object, str], _Detection] = {
         # Position/orientation are decided by _build_pose_pan_handle below;
         # ``select`` is unused for grasp poses but kept consistent.
         select="first",
-        # Handle rim grasp: keep the legacy shallowest-in-patch depth rule.
-        prefer_gemini_pixel_depth=False,
+        # Use Gemini's exact handle pixel depth when it has a valid read, else
+        # snap to the NEAREST valid pixel and deproject there. Gemini's point 1
+        # IS the intended grasp spot on the solid handle, so we trust it rather
+        # than reaching for the shallowest pixel anywhere in the patch.
+        prefer_gemini_pixel_depth=True,
+    ),
+    (Object.PAN, "back_burner"): _Detection(
+        prompt=lambda o: (
+            "In the image, locate the **stove burners**. Each burner position is "
+            "marked by a small **white cross ('+')** on the stove surface. There "
+            "are several white crosses on the stove.\n"
+            "Pick the ONE white cross for the BACK burner: among all the white "
+            "crosses, choose the one that is nearest the TOP of the image "
+            "(farthest from the camera) AND the RIGHTMOST. If there is a tie, "
+            "prefer the upper one.\n"
+            "Return ONE point at the EXACT CENTER of that white cross (where the "
+            "two strokes of the '+' intersect), on the stove surface — not on the "
+            "pan, not on any pot, not on food.\n"
+            "Reply with JSON only:\n"
+            '[{"point": [y, x], "label": "back_burner"}]\n'
+            "Coordinates must be normalized 0-1000 in [y, x] order."
+        ),
+        select="first",
+        # Flat stove surface: trust Gemini's pixel depth (else nearest valid).
+        prefer_gemini_pixel_depth=True,
+        world_offset_m=np.zeros(3, dtype=np.float64),
     ),
     (Object.EGG_CRACKER, "grasp"): _Detection(
         # Grab the BLUE grasp marks directly (one point per handle).
@@ -747,6 +921,10 @@ _PROMPTS: dict[tuple[Object, str], _Detection] = {
             "Coordinates must be normalized 0-1000 in [y, x] order."
         ),
         select="first",
+        # The cradle CENTER is its own target, not the cracker grasp point, so
+        # do NOT inherit EGG_CRACKER's grasp ``gemini_world_offset_m`` (that
+        # offset is tuned for the handle grasp). Use the dedicated cradle offset.
+        world_offset_m=EGG_CRACKER_CRADLE_CENTER_WORLD_OFFSET_M,
     ),
     (Object.TONGS, "grasp"): _Detection(
         # One point per red tape mark; gripper closes ALONG the line between
@@ -756,6 +934,18 @@ _PROMPTS: dict[tuple[Object, str], _Detection] = {
         # Thin tape marks: trust Gemini's exact pixel when it has depth, else
         # snap to the nearest shallowest valid pixel (same as the egg cracker).
         prefer_gemini_pixel_depth=True,
+    ),
+    (Object.WHISK, "grasp"): _Detection(
+        prompt=_whisk_red_tape_prompt,
+        select="midpoint",
+        prefer_gemini_pixel_depth=True,
+        min_depth_m=WHISK_MIN_DEPTH_M,
+    ),
+    (Object.WHISK, "grasp_blue_plaster"): _Detection(
+        prompt=_whisk_blue_plaster_prompt,
+        select="first",
+        prefer_gemini_pixel_depth=True,
+        min_depth_m=WHISK_MIN_DEPTH_M,
     ),
     # Egg: Gemini's point is the grasp spot, so use the default
     # prefer_gemini_pixel_depth=True (exact pixel if it has depth, else the
@@ -868,12 +1058,12 @@ def _save_gemini_response(
     try:
         save_path = Path(ctx.gemini_response_path).expanduser().resolve()
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        depth_panel = depth_vis
+        depth_panel = np.ascontiguousarray(depth_vis).copy()
         if overlay.shape[:2] != depth_panel.shape[:2]:
             depth_panel = cv2.resize(depth_panel, (overlay.shape[1], overlay.shape[0]))
         if patches:
             depth_panel = gp.draw_patch_overlay(depth_panel, patches)
-        color_panel = overlay
+        color_panel = np.ascontiguousarray(overlay).copy()
         if grasp_pixel is not None:
             padded_panels, padded_pixel = _pad_panels_for_pixel(
                 [color_panel, depth_panel], grasp_pixel
@@ -890,7 +1080,8 @@ def _save_gemini_response(
             )
             color_panel = gp.draw_world_marker(color_panel, padded_pixel, label=grasp_label)
             depth_panel = gp.draw_world_marker(depth_panel, padded_pixel, label=grasp_label)
-        cv2.imwrite(str(save_path), np.hstack((color_panel, depth_panel)))
+        composite = np.ascontiguousarray(np.hstack((color_panel, depth_panel))).copy()
+        cv2.imwrite(str(save_path), composite)
         print(f"[gemini] saved response: {save_path}")
     except Exception as e:
         print(f"[gemini] failed to save response: {e}")
@@ -1103,11 +1294,29 @@ def _pan_grasp_orientation_tool_down(
     y_axis /= np.linalg.norm(y_axis)
 
     out = np.column_stack([x_axis, y_axis, z_axis])
+
+    # ``out``'s closing direction (body +Y) is built as ``z × handle`` from the
+    # WORLD-frame handle axis, i.e. perpendicular to the DETECTED axis. But the
+    # +45° Z rotation baked into T_FLANGE_CAMERA (see GRASP_AXIS_YAW_OFFSET_DEG)
+    # rotates the measured handle direction itself by ~45°, so perpendicular-to-
+    # detected lands ~45° off perpendicular-to-true. Apply the same +45° yaw
+    # correction the axis-based ``_apply_perpendicular_yaw`` path uses, about the
+    # tool's straight-down Z, to recover the true perpendicular grasp.
+    if GRASP_AXIS_YAW_OFFSET_DEG:
+        o = np.radians(GRASP_AXIS_YAW_OFFSET_DEG)
+        co, so = np.cos(o), np.sin(o)
+        r_offset = np.array(
+            [[co, -so, 0.0], [so, co, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64
+        )
+        out = out @ r_offset
+
     closing = out[:, 1]
+    closing_yaw = float(np.degrees(np.arctan2(closing[1], closing[0])))
     print(
         f"[gemini:pan] handle axis yaw: {np.degrees(axis_yaw_rad):+.2f} deg  "
-        f"(tool-down perp, closing=[{closing[0]:+.3f}, {closing[1]:+.3f}, "
-        f"{closing[2]:+.3f}])"
+        f"closing yaw: {closing_yaw:+.2f} deg "
+        f"(tool-down perp, yaw_offset={GRASP_AXIS_YAW_OFFSET_DEG:+.1f} deg, "
+        f"closing=[{closing[0]:+.3f}, {closing[1]:+.3f}, {closing[2]:+.3f}])"
     )
     return out, float(np.degrees(axis_yaw_rad)), True
 
@@ -1232,6 +1441,42 @@ def _build_pose_cylinder(
     return GraspPose(position, grasp_ori, axis_yaw_deg, axis_applied)
 
 
+def _build_pose_whisk(
+    ctx: TaskContext,
+    obj: Object,
+    detection: "_Detection",
+    points_camera: list[tuple[float, float, float] | None],
+    orientation_source: str,
+) -> "GraspPose":
+    """Whisk: fixed taught grasp orientation. Accepts a single tape point (used
+    directly) or two tape-axis points (midpoint, p1 Z)."""
+    valid = [p for p in points_camera if p is not None]
+    if len(valid) < 1:
+        raise ValueError(f"whisk grasp: need at least 1 tape point, got {len(valid)}")
+
+    if len(valid) == 1:
+        position = _camera_to_world(ctx, valid[0]) + detection.offset(obj)
+    else:
+        p1 = _camera_to_world(ctx, valid[0])
+        p2 = _camera_to_world(ctx, valid[1])
+        position = _xy_mid_with_p1_z(p1, p2) + detection.offset(obj)
+
+    grasp_ori, _ = _base_grasp_orientation(ctx, obj, orientation_source)
+    fwd = float(OBJECT_DEFAULTS[obj].grasp_forward_tool_z_m)
+    if fwd != 0.0:
+        position = position + grasp_ori[:, 2] * fwd
+    up_z = float(OBJECT_DEFAULTS[obj].grasp_world_z_offset_m)
+    if up_z != 0.0:
+        position[2] += up_z
+    print(
+        f"[gemini:{obj.value}/whisk-pose] world={position.tolist()} "
+        f"(fixed taught grasp orientation"
+        f"{f', +{fwd * 100:.1f} cm along tool +Z' if fwd else ''}"
+        f"{f', +{up_z * 100:.1f} cm world +Z' if up_z else ''})"
+    )
+    return GraspPose(position, grasp_ori, None, False)
+
+
 def _flatten_to_tool_down(R: np.ndarray) -> np.ndarray:
     """Return a tool-straight-down orientation that keeps only ``R``'s yaw.
 
@@ -1313,18 +1558,36 @@ def _build_pose_pan_handle(
     points_camera: list[tuple[float, float, float] | None],
     orientation_source: str,
 ) -> "GraspPose":
-    """Pan: position = point 1 (near-rim grasp); gripper closes across the handle width."""
+    """Pan: position = handle grasp point (point 1); orientation = tool pointing
+    straight down with the jaws closing PERPENDICULAR to the handle axis.
+
+    Gemini returns two points along the handle's long axis. Point 1 is the grasp
+    spot; the (point2 - point1) vector is the handle axis. ``_pan_grasp_orientation_tool_down``
+    projects that axis into world XY, points the tool ``z`` straight down, and
+    sets the closing direction perpendicular to the handle in the horizontal
+    plane, so the gripper closes across the handle width.
+    """
     valid = [p for p in points_camera if p is not None]
     if not valid:
         raise ValueError("pan grasp: no valid points")
     p1 = _camera_to_world(ctx, valid[0])
     position = p1 + detection.offset(obj)
-    grasp_ori = PAN_STATION_GRASP_EE_ORIENTATION.copy()
+    if len(valid) >= 2:
+        p2 = _camera_to_world(ctx, valid[1])
+        grasp_ori, axis_yaw_deg, axis_applied = _pan_grasp_orientation_tool_down(
+            p1, p2
+        )
+    else:
+        print(
+            f"[gemini:{obj.value}/pan-pose] only one handle point; "
+            f"falling back to tool-down (no handle-axis yaw)"
+        )
+        grasp_ori, axis_yaw_deg, axis_applied = EE_ORI_TOOL_DOWN.copy(), None, False
     print(
         f"[gemini:{obj.value}/pan-pose] world={position.tolist()} "
-        f"(fixed PAN_STATION grasp orientation)"
+        f"(tool-down, jaws ⊥ handle axis)"
     )
-    return GraspPose(position, grasp_ori, None, False)
+    return GraspPose(position, grasp_ori, axis_yaw_deg, axis_applied)
 
 
 def _build_pose_egg(
@@ -1381,6 +1644,7 @@ _GRASP_POSE_BUILDERS: dict[Object, GraspPoseBuilder] = {
     # Tongs: two red-tape points → grasp ALONG the line between them (one
     # finger per arm), exactly like the egg cracker.
     Object.TONGS: _build_pose_egg_cracker,
+    Object.WHISK: _build_pose_whisk,
     # Egg: single detected point → world position; tool-down home wrist, no yaw.
     Object.EGG: _build_pose_egg,
 }
@@ -1394,8 +1658,7 @@ def _detect(ctx: TaskContext, obj: Object, kind: str, *, retries: int = 1) -> np
     detection = _PROMPTS.get((obj, kind), _DEFAULT_DETECTION)
     selector = _SELECTORS.get(detection.select, _first_valid)
     client = _ensure_gemini(ctx)
-    pipeline, align, depth_scale, intrinsics = ctx.realsense()
-    from vision import realsense_rgbd as rs_cam
+    _, _, _, intrinsics = ctx.realsense()
 
     prompt = detection.resolve_prompt(obj)
     last_err: Exception | None = None
@@ -1412,13 +1675,8 @@ def _detect(ctx: TaskContext, obj: Object, kind: str, *, retries: int = 1) -> np
 
     while True:
         try:
-            triple = rs_cam.next_rgbd_frame(
-                pipeline,
-                align,
-                depth_scale,
-                ctx.cam_timeout_ms,
-                miss_counter,
-                max_misses=10,
+            triple = _grab_rgbd_frame(
+                ctx, miss_counter, label=f"[gemini:{obj.value}/{kind}]"
             )
             if triple is None:
                 raise RuntimeError("no RGBD frame")
@@ -1516,21 +1774,70 @@ def _validate_grasp_pose(
 ) -> None:
     if obj is not Object.EGG:
         return
+    # Depth/world-z RANGE bounds intentionally removed: legitimate eggs were
+    # being rejected for being a couple cm outside the window (e.g. world z
+    # 0.458 m just over the old 0.45 m cap). We now only reject genuinely
+    # garbage depth reads (NaN / non-positive), which would otherwise lift the
+    # grasp to an impossible pose, and let everything else through.
     valid = [p for p in (points_camera or []) if p is not None]
     depth_m = float(valid[0][2]) if valid else float("nan")
-    z_world = float(pose.position[2])
-    if not math.isfinite(depth_m) or not (EGG_MIN_DEPTH_M <= depth_m <= EGG_MAX_DEPTH_M):
+    if not math.isfinite(depth_m) or depth_m <= 0.0:
         raise _InvalidEggPoseError(
-            f"egg pose rejected: depth {depth_m:.3f} m outside "
-            f"[{EGG_MIN_DEPTH_M:.2f}, {EGG_MAX_DEPTH_M:.2f}] m"
+            f"egg pose rejected: invalid depth read ({depth_m:.3f} m)"
         )
-    if not math.isfinite(z_world) or not (
-        EGG_WORLD_Z_MIN_M <= z_world <= EGG_WORLD_Z_MAX_M
-    ):
-        raise _InvalidEggPoseError(
-            f"egg pose rejected: world z {z_world:.3f} m outside "
-            f"[{EGG_WORLD_Z_MIN_M:.2f}, {EGG_WORLD_Z_MAX_M:.2f}] m"
-        )
+
+
+# Frames to discard before keeping one, so the kept frame is captured at the
+# CURRENT arm pose rather than a stale buffered one from while the arm moved.
+# (try_wait_for_frames returns the oldest queued frame.) ~5 frames at 30 fps
+# clears ≈0.17 s of backlog.
+_FRAME_FLUSH_COUNT = 5
+
+
+def _grab_rgbd_frame(
+    ctx: TaskContext,
+    miss_counter: list[int],
+    *,
+    label: str,
+    max_misses: int = 10,
+    flush_frames: int = _FRAME_FLUSH_COUNT,
+):
+    """One aligned RGBD frame, restarting the RealSense pipeline if it wedges.
+
+    Always pulls the *current* pipeline handles from ``ctx.realsense()`` (so it
+    keeps working after a restart) and grabs a frame. ``flush_frames`` stale
+    buffered frames are discarded first so the returned frame reflects the
+    current camera pose (not one captured while the arm was still moving). If
+    the stream returns nothing within the timeout, the pipeline is hard-restarted
+    once and the grab is retried — the librealsense stream has been seen to wedge
+    on a later detection in a multi-detection routine, which previously aborted
+    the whole run with ``no RGBD frame``. Returns the
+    ``(color_bgr, depth_m, depth_vis)`` triple, or ``None`` if a frame still
+    can't be obtained after the restart.
+    """
+    from vision import realsense_rgbd as rs_cam
+
+    pipeline, align, depth_scale, _ = ctx.realsense()
+    triple = rs_cam.next_rgbd_frame(
+        pipeline, align, depth_scale, ctx.cam_timeout_ms, miss_counter,
+        max_misses=max_misses, flush_frames=flush_frames,
+    )
+    if triple is not None:
+        return triple
+    print(
+        f"{label} RealSense stream wedged (no frame in {ctx.cam_timeout_ms} ms); "
+        "restarting pipeline and retrying once..."
+    )
+    try:
+        pipeline, align, depth_scale, _ = ctx.restart_realsense()
+    except Exception as e:  # noqa: BLE001 - restart is best-effort recovery
+        print(f"{label} RealSense restart failed: {e}")
+        return None
+    miss_counter[0] = 0
+    return rs_cam.next_rgbd_frame(
+        pipeline, align, depth_scale, ctx.cam_timeout_ms, miss_counter,
+        max_misses=max_misses, flush_frames=flush_frames,
+    )
 
 
 def _grasp_pose_attempt(
@@ -1559,8 +1866,6 @@ def _grasp_pose_attempt(
     :class:`_GraspAttempt` (``.error``) instead of raised, so the caller can
     decide whether to recenter-and-retry or count it against the retry budget.
     """
-    from vision import realsense_rgbd as rs_cam
-
     pixels_out: list[tuple[int, int]] = []
     overlay = None
     depth_vis = None
@@ -1568,13 +1873,8 @@ def _grasp_pose_attempt(
     points_camera: list[tuple[float, float, float] | None] | None = None
     image_wh: tuple[int, int] | None = None
     try:
-        triple = rs_cam.next_rgbd_frame(
-            pipeline,
-            align,
-            depth_scale,
-            ctx.cam_timeout_ms,
-            miss_counter,
-            max_misses=10,
+        triple = _grab_rgbd_frame(
+            ctx, miss_counter, label=f"[gemini:{obj.value}/grasp_pose]"
         )
         if triple is None:
             raise RuntimeError("no RGBD frame")
@@ -1662,12 +1962,13 @@ def find_grasp_pose(
     ctx: TaskContext,
     obj: Object,
     *,
+    kind: str = "grasp",
     retries: int = 1,
     orientation_source: str = "fixed",
     depth_quantile: float = GRASP_DEPTH_QUANTILE,
     depth_patch_radius: int = GRASP_DEPTH_PATCH_RADIUS,
 ) -> GraspPose:
-    """Run the Gemini grasp prompt for ``obj`` and dispatch to its pose builder.
+    """Run the Gemini prompt for ``(obj, kind)`` and dispatch to its pose builder.
 
     Per-object position/orientation rules live in ``_GRASP_POSE_BUILDERS``;
     this function only handles the shared work of grabbing a frame, calling
@@ -1686,7 +1987,7 @@ def find_grasp_pose(
     (e.g. the egg) overrides this default, and ``_Detection.min_depth_m``
     imposes a near-field depth floor.
     """
-    detection = _PROMPTS.get((obj, "grasp"), _DEFAULT_DETECTION)
+    detection = _PROMPTS.get((obj, kind), _DEFAULT_DETECTION)
     builder = _grasp_pose_builder(obj)
     client = _ensure_gemini(ctx)
     pipeline, align, depth_scale, intrinsics = ctx.realsense()
@@ -1704,6 +2005,7 @@ def find_grasp_pose(
         ctx.gemini_response_path = str(resolved_path)
 
     prompt = detection.resolve_prompt(obj)
+    log_kind = f"{kind}_pose" if kind != "grasp" else "grasp_pose"
     last_err: Exception | None = None
     miss_counter = [0]
     # See note in ``_detect``: timeouts are auto-retried up to
@@ -1736,8 +2038,8 @@ def find_grasp_pose(
             except gp.GeminiTimeoutError as e:
                 last_err = e
                 timeout_count += 1
-                print(f"[gemini:{obj.value}/grasp_pose] timed out: {e}")
-                handle_gemini_timeout(obj.value, "grasp_pose", timeout_count)
+                print(f"[gemini:{obj.value}/{log_kind}] timed out: {e}")
+                handle_gemini_timeout(obj.value, log_kind, timeout_count)
                 continue
 
             if attempt.error is not None:
@@ -1752,12 +2054,12 @@ def find_grasp_pose(
                 error_attempts += 1
                 timeout_count = 0
                 print(
-                    f"[gemini:{obj.value}/grasp_pose] attempt {error_attempts} failed: "
+                    f"[gemini:{obj.value}/{log_kind}] attempt {error_attempts} failed: "
                     f"{attempt.error}"
                 )
                 if error_attempts > retries:
                     raise RuntimeError(
-                        f"gemini grasp pose for {obj.value} failed: {last_err}"
+                        f"gemini {kind} pose for {obj.value} failed: {last_err}"
                     ) from last_err
                 continue
 
@@ -1963,16 +2265,15 @@ def find_grasp_pose_recentering(
                 )
 
             pixel = attempt.pixels[0] if attempt.pixels else None
-            if pixel is not None and recenter_moves < max_recenter_moves:
-                # A bogus egg depth/world-Z can still come from a near-centered
-                # pixel (for example when Gemini lands inside the held tongs).
-                # Force the same recenter nudge anyway so the next frame is not
-                # taken from the identical bad view.
-                recenter_tol = (
-                    -1.0
-                    if isinstance(attempt.error, _InvalidEggPoseError)
-                    else center_tol_frac
-                )
+            # ONLY recenter when the failure is a bad DEPTH / world-Z reading
+            # (``_InvalidEggPoseError``). A fresh viewpoint can give a clean
+            # depth, and a bogus depth can come from a near-centered pixel (e.g.
+            # Gemini lands inside the held tongs), so force the nudge regardless
+            # of how centered the pixel is. Every OTHER miss (no points, build
+            # error) — even with the egg off-center — is NOT a reason to nudge;
+            # it falls straight through to the normal retry budget.
+            depth_off = isinstance(attempt.error, _InvalidEggPoseError)
+            if depth_off and pixel is not None and recenter_moves < max_recenter_moves:
                 moved = _recenter_ee_toward_pixel(
                     ctx,
                     pixel,
@@ -1982,14 +2283,14 @@ def find_grasp_pose_recentering(
                     gain=recenter_gain,
                     max_step_m=max_recenter_step_m,
                     nominal_depth_m=nominal_depth_m,
-                    center_tol_frac=recenter_tol,
+                    center_tol_frac=-1.0,
                     label=f"[gemini:{obj.value}/recenter]",
                 )
                 if moved:
                     recenter_moves += 1
                     print(
                         f"[gemini:{obj.value}/grasp_pose] recenter move "
-                        f"{recenter_moves}/{max_recenter_moves} after detection "
+                        f"{recenter_moves}/{max_recenter_moves} after bad-depth "
                         f"miss: {attempt.error}"
                     )
                     continue
@@ -2022,3 +2323,185 @@ def find_handle(ctx: TaskContext, obj: Object, *, retries: int = 1) -> np.ndarra
 
 def find_drop_target(ctx: TaskContext, obj: Object, *, retries: int = 1) -> np.ndarray:
     return _detect(ctx, obj, "drop", retries=retries)
+
+
+def find_back_burner(ctx: TaskContext, *, retries: int = 1) -> np.ndarray:
+    """Detect the back-burner white cross center (rightmost + uppermost) in world.
+
+    Returns the world XYZ of the chosen burner's cross center. Callers that only
+    need the burner's world X (e.g. to align the pan with it) can ignore Y/Z.
+    """
+    return _detect(ctx, Object.PAN, "back_burner", retries=retries)
+
+
+# --- Bowl drop-center detection (crack / pour targets) ----------------------
+# Radius (px) searched for a valid-depth pixel near Gemini's center point when
+# the exact center pixel has no reading (dark interior). ~40 px at ~25-45 cm
+# range covers several cm of world.
+BOWL_DROP_DEPTH_PATCH_RADIUS = 40
+# Reject near-field depth (gripper fingers, held cracker, glints) closer than
+# this floor so they can't supply the center depth.
+BOWL_DROP_MIN_DEPTH_M = 0.05
+
+
+def find_bowl_drop_center(
+    ctx: TaskContext,
+    obj: Object,
+    *,
+    kind: str = "center",
+    retries: int = 1,
+) -> np.ndarray:
+    """Detect a bowl's center and return the world drop point.
+
+    Uses the single Gemini center point, deprojected at the pixel as close to
+    the center as possible that has a valid depth (``prefer_gemini_pixel=True``):
+    if the exact center pixel has a depth reading it's used directly, otherwise
+    the NEAREST pixel to it with a valid depth (>= ``BOWL_DROP_MIN_DEPTH_M``,
+    within ``BOWL_DROP_DEPTH_PATCH_RADIUS``) supplies the point. The caller adds
+    its own +Z offset (the crack/pour point sits above this center).
+    """
+    detection = _PROMPTS.get((obj, kind), _DEFAULT_DETECTION)
+    client = _ensure_gemini(ctx)
+    _, _, _, intrinsics = ctx.realsense()
+
+    prompt = detection.resolve_prompt(obj)
+    last_err: Exception | None = None
+    miss_counter = [0]
+    error_attempts = 0
+    timeout_count = 0
+
+    while True:
+        try:
+            triple = _grab_rgbd_frame(
+                ctx, miss_counter, label=f"[gemini:{obj.value}/{kind}]"
+            )
+            if triple is None:
+                raise RuntimeError("no RGBD frame")
+            color_bgr, depth_m, depth_vis = triple
+            overlay, points_camera, patches = gp.query_color_depth_overlay(
+                client,
+                ctx.gemini_model,
+                prompt,
+                ctx.gemini_temperature,
+                color_bgr,
+                depth_m,
+                intrinsics,
+                BOWL_DROP_DEPTH_PATCH_RADIUS,
+                prefer_gemini_pixel=True,
+                min_depth_m=BOWL_DROP_MIN_DEPTH_M,
+            )
+            _save_gemini_response(ctx, overlay, depth_vis, patches)
+            if not points_camera or points_camera[0] is None:
+                raise ValueError("center point had no usable depth in range")
+            center_world = _camera_to_world(ctx, points_camera[0])
+            position = center_world + detection.offset(obj)
+            print(f"[gemini:{obj.value}/{kind}] center_world={position.tolist()}")
+            return position
+        except gp.GeminiTimeoutError as e:
+            last_err = e
+            timeout_count += 1
+            print(f"[gemini:{obj.value}/{kind}] timed out: {e}")
+            handle_gemini_timeout(obj.value, kind, timeout_count)
+            continue
+        except Exception as e:  # noqa: BLE001 - surfaced via the retry budget
+            last_err = e
+            error_attempts += 1
+            timeout_count = 0
+            print(
+                f"[gemini:{obj.value}/{kind}] attempt {error_attempts} failed: {e}"
+            )
+            if error_attempts > retries:
+                raise RuntimeError(
+                    f"gemini {kind} for {obj.value} failed: {last_err}"
+                ) from last_err
+
+
+def find_pan_center_radius(
+    ctx: TaskContext,
+    obj: Object = Object.PAN,
+    *,
+    kind: str = "center_rim",
+    retries: int = 1,
+) -> tuple[np.ndarray, float | None]:
+    """Detect a pan's center AND a rim point; return ``(center_world, radius_m)``.
+
+    Gemini returns two points (center first, then a point on the rim). Both are
+    deprojected with the same valid-depth policy as :func:`find_bowl_drop_center`
+    (``prefer_gemini_pixel=True``): the exact pixel when it has a depth reading,
+    else the NEAREST pixel with a valid depth in range. The radius is the
+    HORIZONTAL (world XY) distance between the center and rim points, which is
+    robust to the rim sitting higher than the floor. ``radius_m`` is ``None``
+    when the rim point could not be deprojected (center is still returned).
+    """
+    detection = _PROMPTS.get((obj, kind), _DEFAULT_DETECTION)
+    client = _ensure_gemini(ctx)
+    _, _, _, intrinsics = ctx.realsense()
+
+    prompt = detection.resolve_prompt(obj)
+    last_err: Exception | None = None
+    miss_counter = [0]
+    error_attempts = 0
+    timeout_count = 0
+
+    while True:
+        try:
+            triple = _grab_rgbd_frame(
+                ctx, miss_counter, label=f"[gemini:{obj.value}/{kind}]"
+            )
+            if triple is None:
+                raise RuntimeError("no RGBD frame")
+            color_bgr, depth_m, depth_vis = triple
+            overlay, points_camera, patches = gp.query_color_depth_overlay(
+                client,
+                ctx.gemini_model,
+                prompt,
+                ctx.gemini_temperature,
+                color_bgr,
+                depth_m,
+                intrinsics,
+                BOWL_DROP_DEPTH_PATCH_RADIUS,
+                prefer_gemini_pixel=True,
+                min_depth_m=BOWL_DROP_MIN_DEPTH_M,
+            )
+            _save_gemini_response(ctx, overlay, depth_vis, patches)
+            if not points_camera or points_camera[0] is None:
+                raise ValueError("center point had no usable depth in range")
+            center_world = _camera_to_world(ctx, points_camera[0])
+            position = center_world + detection.offset(obj)
+
+            radius_m: float | None = None
+            if len(points_camera) > 1 and points_camera[1] is not None:
+                rim_world = _camera_to_world(ctx, points_camera[1])
+                radius_m = float(
+                    np.linalg.norm(rim_world[:2] - center_world[:2])
+                )
+                print(
+                    f"[gemini:{obj.value}/{kind}] rim_world={rim_world.tolist()} "
+                    f"radius={radius_m:.4f} m"
+                )
+            else:
+                print(
+                    f"[gemini:{obj.value}/{kind}] rim point had no usable depth "
+                    f"in range — radius unavailable."
+                )
+            print(
+                f"[gemini:{obj.value}/{kind}] center_world={position.tolist()}"
+            )
+            return position, radius_m
+        except gp.GeminiTimeoutError as e:
+            last_err = e
+            timeout_count += 1
+            print(f"[gemini:{obj.value}/{kind}] timed out: {e}")
+            handle_gemini_timeout(obj.value, kind, timeout_count)
+            continue
+        except Exception as e:  # noqa: BLE001 - surfaced via the retry budget
+            last_err = e
+            error_attempts += 1
+            timeout_count = 0
+            print(
+                f"[gemini:{obj.value}/{kind}] attempt {error_attempts} failed: {e}"
+            )
+            if error_attempts > retries:
+                raise RuntimeError(
+                    f"gemini {kind} for {obj.value} failed: {last_err}"
+                ) from last_err

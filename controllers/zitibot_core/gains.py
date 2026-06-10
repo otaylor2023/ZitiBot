@@ -43,6 +43,15 @@ class CartPositionGainSnapshot:
     ki: float | None = None
 
 
+@dataclass(frozen=True)
+class JointGainSnapshot:
+    """Pre-boost joint-task gains returned by :func:`boosted_joint_gains`."""
+
+    kp: float | None
+    kv: float | None
+    ki: float | None = None
+
+
 def _decode_scalar_gain(raw: bytes | str | None) -> float | None:
     """Parse one of the JSON 1-element gain values written by OpenSai."""
     if raw is None:
@@ -227,6 +236,76 @@ def restore_cart_position_gains(
     )
 
 
+def read_joint_gains(
+    redis_client,
+) -> tuple[float | None, float | None, float | None]:
+    """Return ``(kp, kv, ki)`` for the joint task, or ``None`` per missing slot."""
+    return (
+        _decode_scalar_gain(redis_client.get(KEYS.joint_task_kp)),
+        _decode_scalar_gain(redis_client.get(KEYS.joint_task_kv)),
+        _decode_scalar_gain(redis_client.get(KEYS.joint_task_ki)),
+    )
+
+
+def set_joint_gains(
+    redis_client,
+    *,
+    kp: float | None = None,
+    kv: float | None = None,
+    ki: float | None = None,
+) -> None:
+    """Write joint-task ``kp`` / ``kv`` / ``ki`` gains to Redis."""
+    if kp is not None:
+        redis_client.set(KEYS.joint_task_kp, _encode_scalar_gain(kp))
+    if kv is not None:
+        redis_client.set(KEYS.joint_task_kv, _encode_scalar_gain(kv))
+    if ki is not None:
+        redis_client.set(KEYS.joint_task_ki, _encode_scalar_gain(ki))
+
+
+@contextmanager
+def boosted_joint_gains(
+    redis_client,
+    *,
+    kp: float | None = None,
+    kv: float | None = None,
+    ki: float | None = None,
+    label: str = "",
+) -> Iterator[None]:
+    """Temporarily raise joint-task gains and restore them on exit."""
+    if kp is None and kv is None and ki is None:
+        yield
+        return
+
+    cur_kp, cur_kv, cur_ki = read_joint_gains(redis_client)
+    snapshot = JointGainSnapshot(
+        kp=cur_kp if kp is not None else None,
+        kv=cur_kv if kv is not None else None,
+        ki=cur_ki if ki is not None else None,
+    )
+    set_joint_gains(redis_client, kp=kp, kv=kv, ki=ki)
+    tag = f" ({label})" if label else ""
+    print(
+        f"[gains]{tag} joint kp/kv/ki: "
+        f"({snapshot.kp}, {snapshot.kv}, {snapshot.ki}) -> "
+        f"({kp if kp is not None else cur_kp}, "
+        f"{kv if kv is not None else cur_kv}, "
+        f"{ki if ki is not None else cur_ki})",
+        flush=True,
+    )
+    try:
+        yield
+    finally:
+        set_joint_gains(
+            redis_client, kp=snapshot.kp, kv=snapshot.kv, ki=snapshot.ki
+        )
+        print(
+            f"[gains]{tag} joint kp/kv/ki restored to "
+            f"({snapshot.kp}, {snapshot.kv}, {snapshot.ki})",
+            flush=True,
+        )
+
+
 def read_otg_max_linear_velocity(redis_client) -> float | None:
     """Return the cartesian task's OTG linear-velocity cap (m/s), or ``None``.
 
@@ -287,6 +366,61 @@ def set_otg_max_angular_velocity(redis_client, value: float) -> None:
     redis_client.set(
         KEYS.cartesian_task_otg_max_angular_velocity, str(float(value))
     )
+
+
+def read_otg_enabled(redis_client) -> bool | None:
+    """Return whether the cartesian task's internal OTG is enabled, or ``None``.
+
+    Stored as a bare ``"0"`` / ``"1"`` string in the controller's receive
+    group (re-read every loop), so writes take effect without a restart.
+    """
+    raw = redis_client.get(KEYS.cartesian_task_otg_enabled)
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    raw = raw.strip()
+    if not raw:
+        return None
+    return raw not in ("0", "0.0", "false", "False")
+
+
+def set_otg_enabled(redis_client, enabled: bool) -> None:
+    """Enable / disable the cartesian task's internal OTG.
+
+    Written as a bare ``"1"`` / ``"0"`` string. Disabling the OTG makes the
+    controller track streamed goal poses directly (no per-write trajectory
+    re-plan), which is what we want while publishing a dense trajectory such
+    as the scramble stir; re-enable it afterward for ordinary point-to-point
+    moves.
+    """
+    redis_client.set(
+        KEYS.cartesian_task_otg_enabled, "1" if enabled else "0"
+    )
+
+
+@contextmanager
+def otg_disabled(redis_client) -> Iterator[None]:
+    """Disable the cartesian OTG for the duration of the ``with`` block.
+
+    Snapshots the current ``otg_enabled`` flag on entry, forces it off, and
+    restores the prior value on exit (defaulting to re-enabled if the flag
+    couldn't be read). Use around streamed-trajectory phases so the arm
+    tracks the published setpoints directly instead of re-planning on every
+    10 Hz write.
+    """
+    prior = read_otg_enabled(redis_client)
+    set_otg_enabled(redis_client, False)
+    print("[gains] cartesian OTG disabled for streamed trajectory.", flush=True)
+    try:
+        yield
+    finally:
+        restore_to = True if prior is None else prior
+        set_otg_enabled(redis_client, restore_to)
+        print(
+            f"[gains] cartesian OTG restored to enabled={restore_to}.",
+            flush=True,
+        )
 
 
 @dataclass(frozen=True)

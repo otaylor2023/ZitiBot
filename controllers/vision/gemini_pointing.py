@@ -666,7 +666,11 @@ def draw_points(
 
 def encode_png(img_bgr: np.ndarray) -> bytes:
 
-    ok, buf = cv2.imencode(".png", img_bgr)
+    # Keep OpenCV away from strided/view-backed buffers. Most callers pass
+    # owned RealSense copies, but the extra contiguous copy is cheap compared
+    # with the Gemini request and avoids native lifetime surprises.
+    img = np.ascontiguousarray(img_bgr).copy()
+    ok, buf = cv2.imencode(".png", img)
 
     if not ok:
         raise RuntimeError("Failed to encode PNG.")
@@ -1124,6 +1128,13 @@ def query_color_depth_overlay(
     read it here; the normal grasp path leaves it ``None``.
     """
 
+    # Defensive copies at the native-library boundary. The RealSense capture
+    # layer already copies SDK-owned frame memory, but downstream OpenCV drawing
+    # and encoding are native calls too; keep each Gemini attempt isolated from
+    # any shared/view-backed array state.
+    color_bgr = np.ascontiguousarray(color_bgr).copy()
+    depth_m = np.ascontiguousarray(depth_m).copy()
+
     print("Sending frame to Gemini ER...")
 
     t0 = time.perf_counter()
@@ -1154,7 +1165,7 @@ def query_color_depth_overlay(
             file=sys.stderr,
         )
 
-        return None, None
+        return None, [], []
 
     dt_ms = (time.perf_counter() - t0) * 1000.0
 

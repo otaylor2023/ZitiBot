@@ -454,10 +454,17 @@ fi
 echo "4) Starting ${CONTROLLER_NAME}: ${PYTHON} ${CONTROLLER_PATH} ${CONTROLLER_ARGS[*]-}"
 echo "   (Ctrl+C to stop controller and all drivers.)"
 
+# Optional debug wrapper for the controller process ONLY (drivers above are
+# untouched). Set CONTROLLER_WRAPPER to a command prefix to run the Python
+# controller under a debugger / tool, e.g. to capture a native backtrace on a
+# heap-corruption SIGABRT:
+#   CONTROLLER_WRAPPER="gdb -q -batch -ex run -ex bt -ex 'thread apply all bt' --args" \
+#     ./launch_zitibot_full.sh controllers/routines/crack_eggs_state_machine.py
+# (unquoted expansion below is intentional so the prefix word-splits into argv)
 CTRL_EXIT=0
 (
 	cd "${CONTROLLER_DIR}"
-	exec "${PYTHON}" "${CONTROLLER_SCRIPT}" "${CONTROLLER_ARGS[@]}"
+	exec ${CONTROLLER_WRAPPER:-} "${PYTHON}" "${CONTROLLER_SCRIPT}" "${CONTROLLER_ARGS[@]}"
 ) || CTRL_EXIT=$?
 
 if [[ ${CTRL_EXIT} -ne 0 ]]; then

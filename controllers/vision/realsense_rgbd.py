@@ -81,8 +81,21 @@ def next_rgbd_frame(
     timeout_ms: int,
     miss_counter: list[int],
     max_misses: int,
+    flush_frames: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """Aligned color BGR, depth in meters, and depth BGR colormap for preview."""
+    """Aligned color BGR, depth in meters, and depth BGR colormap for preview.
+
+    ``flush_frames``: discard this many freshly-grabbed frames before keeping
+    one. ``try_wait_for_frames`` returns the OLDEST buffered frame, so after the
+    arm has been moving (and nothing polled the camera) the first grab is a
+    stale frame captured at an earlier pose. Pulling and discarding a few frames
+    first ensures the kept frame was actually captured at (or just after) the
+    current pose. At 30 fps, ~5 flush frames ≈ 0.17 s of staleness cleared.
+    """
+    for _ in range(max(0, flush_frames)):
+        ok_flush, _stale = pipeline.try_wait_for_frames(timeout_ms)
+        if not ok_flush:
+            break
     ok, frames = pipeline.try_wait_for_frames(timeout_ms)
     if not ok:
         miss_counter[0] += 1

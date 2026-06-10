@@ -13,6 +13,7 @@ import redis
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 
+from zitibot_core import gains
 from zitibot_core.constants import CONFIG_XML, CONTROLLER_TO_USE, JOINT_CONTROLLER
 from zitibot_core.redis_keys import (
     CONTROLLER_WAIT_DT_S,
@@ -450,6 +451,125 @@ def move_to_joints_partial(
         settle_ticks=settle_ticks,
         gated=gated,
     )
+
+
+def shake_joint(
+    ctx,
+    *,
+    joint_index: int = 0,
+    one_indexed: bool = False,
+    shake_delta_deg: float,
+    shake_cycles: int,
+    tol_rad: float = 0.15,
+    timeout_s: float = 3.0,
+    use_warmup: bool = True,
+    warmup_delta_deg: float = 3.0,
+    warmup_tol_rad: float = 0.05,
+    warmup_timeout_s: float = 2.0,
+    post_switch_wait_s: float = 0.0,
+    label_prefix: str = "[shake]",
+    joint_kp: float | None = 250.0,
+    joint_kv: float | None = 40.0,
+) -> None:
+    """Wobble a single joint ±delta for N UP/DOWN cycles to dislodge a held object.
+
+    Generalised from the egg-cracker's post-crack / post-release J0 shake.
+    Stays in ``joint_controller`` the whole time so every cycle runs under a
+    single ENTER press in ``--step`` mode. Each stroke is RELATIVE to the live
+    joint reading at the start of that stroke, so a DOWN stroke always returns
+    to where its matching UP stroke started even if a stroke doesn't perfectly
+    converge.
+
+    ``joint_index`` selects which joint to shake (0-indexed by default; pass
+    ``one_indexed=True`` to use Franka "J1..J7" numbering).
+
+    The cartesian→joint controller swap needs to settle before the first real
+    stroke or it tends to eat that stroke (the joint controller reseeds its
+    goal to the live measured joints when it activates). Two ways to force it:
+
+    * ``use_warmup=True`` (default): issue a tiny ``+warmup_delta_deg`` nudge
+      first as a "fake" move so the swap lands on a near-current goal.
+    * ``use_warmup=False``: seed the current joints as the goal (zero motion),
+      switch controllers, then ``time.sleep(post_switch_wait_s)`` before the
+      first stroke.
+
+    Falls back to a printed warning + no-op if joint positions aren't available
+    from Redis.
+    """
+    j = int(joint_index) - 1 if one_indexed else int(joint_index)
+
+    q_pre = read_joint_positions(ctx.redis)
+    if q_pre is None or q_pre.size <= j or j < 0:
+        print(
+            f"{label_prefix} WARNING: joint positions unavailable from Redis "
+            f"(need index {j}); skipping shake (warmup + cycles)."
+        )
+        return
+
+    with gains.boosted_joint_gains(
+        ctx.redis, kp=joint_kp, kv=joint_kv, label=label_prefix
+    ):
+        if use_warmup:
+            q_warmup_rad = float(q_pre[j]) + math.radians(warmup_delta_deg)
+            print(
+                f"{label_prefix}-warmup J{j} warm-up nudge to "
+                f"{math.degrees(q_warmup_rad):+.1f}° "
+                f"(forces cartesian→joint controller swap)"
+            )
+            move_to_joints_partial(
+                ctx,
+                {j: q_warmup_rad},
+                degrees=False,
+                one_indexed=False,
+                label=(
+                    f"  [arm] {label_prefix} warm-up J{j}"
+                    f"={math.degrees(q_warmup_rad):+.1f}°"
+                ),
+                tol_rad=warmup_tol_rad,
+                timeout_s=warmup_timeout_s,
+                gated=False,
+            )
+        else:
+            print(
+                f"{label_prefix} no warmup; seeding current joints + switching to "
+                f"joint controller, waiting {post_switch_wait_s * 1000:.0f} ms for swap."
+            )
+            publish_goal_joint(ctx.redis, q_pre)
+            if post_switch_wait_s > 0:
+                time.sleep(post_switch_wait_s)
+
+        delta_deg = float(shake_delta_deg)
+        cycles = int(shake_cycles)
+        for cycle in range(cycles):
+            for direction, sign in (("UP", +1.0), ("DOWN", -1.0)):
+                q_now = read_joint_positions(ctx.redis)
+                if q_now is None or q_now.size <= j:
+                    print(
+                        f"{label_prefix} cyc {cycle + 1}/{cycles} {direction}: "
+                        f"WARNING: joint positions unavailable; aborting shake."
+                    )
+                    return
+                qj_now = float(q_now[j])
+                qj_goal = qj_now + sign * math.radians(delta_deg)
+                print(
+                    f"{label_prefix} cyc {cycle + 1}/{cycles} {direction}: "
+                    f"J{j} {math.degrees(qj_now):+.1f}° → "
+                    f"{math.degrees(qj_goal):+.1f}° "
+                    f"({'+' if sign > 0 else '-'}{delta_deg:.0f}°)"
+                )
+                move_to_joints_partial(
+                    ctx,
+                    {j: qj_goal},
+                    degrees=False,
+                    one_indexed=False,
+                    label=(
+                        f"  [arm] {label_prefix} cyc {cycle + 1} {direction} "
+                        f"J{j}={math.degrees(qj_goal):+.1f}°"
+                    ),
+                    tol_rad=tol_rad,
+                    timeout_s=timeout_s,
+                    gated=False,
+                )
 
 
 def read_joint_velocities(redis_client) -> np.ndarray | None:

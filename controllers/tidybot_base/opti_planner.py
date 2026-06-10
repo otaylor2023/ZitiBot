@@ -38,7 +38,7 @@ from tidybot_base.se2 import (
 # re-create the rigid body in Motive). Override via
 # ``--marker-yaw-offset-deg`` on ``opti_controller``, or by passing a
 # ``NavConfig(marker_yaw_offset_deg=...)`` to ``opti_nav``.
-DEFAULT_MARKER_YAW_OFFSET_DEG = 40.50
+DEFAULT_MARKER_YAW_OFFSET_DEG = -38.17
 
 # Legacy alias kept for backwards-compat with prior code/CLI.
 ROBOT_FRAME_ROT_DEG = DEFAULT_MARKER_YAW_OFFSET_DEG

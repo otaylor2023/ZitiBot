@@ -26,7 +26,6 @@ RealSense, OptiTrack on Redis, and ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``.
 """
 
 from __future__ import annotations
-
 import argparse
 import sys
 import time

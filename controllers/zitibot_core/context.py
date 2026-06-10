@@ -108,6 +108,18 @@ class TaskContext:
             self._realsense_depth_scale = None
             self._realsense_intrinsics = None
 
+    def restart_realsense(self):
+        """Stop and re-start the RealSense pipeline; return fresh handles.
+
+        Recovery hook for when the stream wedges (``try_wait_for_frames``
+        returns nothing for the full timeout, which has been observed on a
+        later detection in a multi-detection routine). A fresh
+        ``start_realsense`` re-homes the device, re-runs warmup, and resumes
+        streaming, so a single stalled grab no longer aborts the whole routine.
+        """
+        self.stop_realsense()
+        return self.realsense()
+
 
 def make_context(
     args: argparse.Namespace | None = None,

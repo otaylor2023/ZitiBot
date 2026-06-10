@@ -43,6 +43,8 @@ def object(
     move_timeout_s: float | None = None,
     precise: bool = True,
     keep_grip: bool = False,
+    require_convergence: bool = False,
+    pre_close_lift_dz_m: float = 0.0,
 ) -> np.ndarray:
     """Approach, descend, grasp, and lift an object. Returns the lifted pose.
 
@@ -108,6 +110,14 @@ def object(
         Optional override for ``arm.move_to`` convergence timeout (seconds)
         on every move inside this grasp sequence. ``None`` (default) uses
         the project-wide ``arm.move_to`` default (3 s).
+    require_convergence
+        When ``True``, raise ``RuntimeError`` if the arm does not reach the
+        pre-grasp "above" or descent-to-pick goals within tolerance (instead
+        of force-closing after a move timeout).
+    pre_close_lift_dz_m
+        After descending to ``pick`` and before closing, move straight up in
+        world +Z by this many meters (default 0 = no move). ``pick`` and the
+        post-grasp lift target are updated to the raised pose.
     """
     spec = _resolve_spec(obj)
     if pick_pos is None:
@@ -165,6 +175,23 @@ def object(
             gains.restore_precise_grasp(ctx.redis, snap, label=f"grasp:{obj.value}")
             precise_state["snapshot"] = None
 
+    def _assert_near(goal_pos: np.ndarray, tol_m: float, phase: str) -> None:
+        if not require_convergence:
+            return
+        pose = arm.read_current_ee_world(ctx.redis)
+        if pose is None:
+            raise RuntimeError(f"[grasp:{obj.value}] {phase}: EE pose unavailable")
+        cur_pos = np.asarray(pose[0], dtype=np.float64).reshape(3)
+        goal = np.asarray(goal_pos, dtype=np.float64).reshape(3)
+        err = float(np.linalg.norm(cur_pos - goal))
+        if err > tol_m:
+            raise RuntimeError(
+                f"[grasp:{obj.value}] {phase}: arm did not reach goal "
+                f"(err={err:.3f} m > tol={tol_m:.3f} m). "
+                f"cur={cur_pos.tolist()} goal={goal.tolist()}. "
+                "Refusing to close the gripper in the air."
+            )
+
     try:
         arm.move_to(
             ctx,
@@ -176,6 +203,7 @@ def object(
             on_within_m=PRECISE_GRASP_WITHIN_M if precise else None,
             on_within=_engage_precise if precise else None,
         )
+        _assert_near(above, spec.approach_tol, "move above pick")
         if on_above is not None:
             on_above()
         grasp_tol = float(grasp_tol_m) if grasp_tol_m is not None else float(spec.grasp_tol)
@@ -187,6 +215,22 @@ def object(
             tol_m=grasp_tol,
             timeout_s=precise_timeout,
         )
+        _assert_near(pick, grasp_tol, "lower to pick")
+        pre_lift = float(pre_close_lift_dz_m)
+        if pre_lift > 0.0:
+            pick = pick + np.array([0.0, 0.0, pre_lift], dtype=np.float64)
+            arm.move_to(
+                ctx,
+                pick,
+                grip_R,
+                label=(
+                    f"[grasp:{obj.value}] pre-close lift +{pre_lift * 100:.1f} cm "
+                    f"to {pick.tolist()}"
+                ),
+                tol_m=grasp_tol,
+                timeout_s=precise_timeout,
+            )
+            _assert_near(pick, grasp_tol, "pre-close lift")
         if close_mode == "move":
             step_gate(
                 ctx,
@@ -201,19 +245,27 @@ def object(
             step_gate(ctx, f"[grasp:{obj.value}] grasp (force-close, force={spec.force:.1f} N)")
             # Force-close all the way — no pre-grasp pre-open step.
             gripper.grasp(ctx.redis, spec.close_width, speed=spec.speed, force=spec.force)
-            time.sleep(4)
+            time.sleep(spec.grasp_force_close_settle_s)
         # Gripper is closed — drop back to normal stiffness/speed before the
         # lift so the carry move runs at the usual cartesian gains/velocity.
         _restore_precise()
+        lifted = pick + np.array([0.0, 0.0, lift_dz], dtype=np.float64)
         lift_tol = float(lift_tol_m) if lift_tol_m is not None else float(spec.approach_tol)
-        arm.move_to(
-            ctx,
-            lifted,
-            grip_R,
-            label=f"[grasp:{obj.value}] lift to {lifted.tolist()} (+{lift_dz * 100:.1f} cm)",
-            tol_m=lift_tol,
-            timeout_s=base_timeout,
-        )
+        is_carry_lift = lift_dz > 1e-6
+        lift_timeout = max(base_timeout, 12.0) if is_carry_lift else base_timeout
+        lift_move_kwargs: dict = {}
+        if is_carry_lift:
+            # Skip velocity settle so a slow final inch doesn't burn timeout.
+            lift_move_kwargs["vel_tol_rad_s"] = None
+            arm.move_to(
+                ctx,
+                lifted,
+                grip_R,
+                label=f"[grasp:{obj.value}] lift to {lifted.tolist()} (+{lift_dz * 100:.1f} cm)",
+                tol_m=lift_tol,
+                timeout_s=lift_timeout,
+                **lift_move_kwargs,
+            )
     finally:
         _restore_precise()
     print(f"[grasp:{obj.value}] lift complete at {lifted.tolist()}")

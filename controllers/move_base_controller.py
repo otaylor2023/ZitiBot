@@ -94,26 +94,11 @@ def main() -> int:
     arm_pose = np.array(args.arm_pose, dtype=np.float64)
     grip_R = DEFAULT_ARM_ORIENTATION.copy()
 
-    # Use the named waypoint when the user hasn't overridden any base flag,
-    # so the canonical OVEN_DOOR pose (with its label) is what go_to_pose
-    # actually sees. Any raw --base-x/y/yaw override switches to raw mode.
-    base_overridden = (
-        args.base_x != DEFAULT_BASE_X
-        or args.base_y != DEFAULT_BASE_Y
-        or args.base_yaw_deg != DEFAULT_BASE_YAW_DEG
-    )
-
     print(f"Arm pose : {arm_pose.tolist()}")
-    if base_overridden:
-        print(
-            f"Base goal: x={args.base_x:.3f} m, y={args.base_y:.3f} m, "
-            f"yaw={args.base_yaw_deg:.1f} deg (raw override)"
-        )
-    else:
-        print(
-            f"Base goal: {_DEFAULT_BASE_WAYPOINT.name} "
-            f"({args.base_x:.3f}, {args.base_y:.3f}, {args.base_yaw_deg:.1f} deg)"
-        )
+    print(
+        f"Base goal: x={args.base_x:.3f} m, y={args.base_y:.3f} m, "
+        f"yaw={args.base_yaw_deg:.1f} deg"
+    )
 
     try:
         if not args.skip_arm:
@@ -127,19 +112,16 @@ def main() -> int:
             print("[move-base] skipping arm move (--skip-arm)")
 
         if not args.skip_base:
-            if base_overridden:
-                base.go_to_pose(
-                    ctx,
-                    x_m=args.base_x,
-                    y_m=args.base_y,
-                    yaw_deg=args.base_yaw_deg,
-                    label=(
-                        f"[move-base] base to ({args.base_x:.3f}, {args.base_y:.3f}, "
-                        f"{args.base_yaw_deg:.1f}°)"
-                    ),
-                )
-            else:
-                base.go_to_pose(ctx, _DEFAULT_BASE_WAYPOINT)
+            base.go_to_pose(
+                ctx,
+                x_m=args.base_x,
+                y_m=args.base_y,
+                yaw_deg=args.base_yaw_deg,
+                label=(
+                    f"[move-base] base to ({args.base_x:.3f}, {args.base_y:.3f}, "
+                    f"{args.base_yaw_deg:.1f}°)"
+                ),
+            )
         else:
             print("[move-base] skipping base move (--skip-base)")
     except KeyboardInterrupt:

@@ -157,6 +157,7 @@ def go_to_pose(
     config: NavConfig | None = None,
     label: str | None = None,
     motion: str = "holonomic",
+    hold_yaw: bool = False,
 ) -> NavResult:
     """Navigate the base to either a :class:`BaseWaypoint` preset or a raw pose.
 
@@ -300,35 +301,39 @@ def go_to_pose(
         )
 
     if motion == "holonomic":
-        # Single-phase drive straight to (final_x, final_y, final_yaw).
-        # Use the configured tolerances directly — no early handoff,
-        # no rotate-in-place, no separate translate phase. Faster and
-        # smoother than the three-phase path; downstream tasks that
-        # don't need tight base alignment (most of them) should use
-        # this default. We also bump the driver's OTG max_velocity by
-        # HOLONOMIC_BASE_SPEED_SCALE so the long traverse runs faster
-        # than the precise three-phase landing.
+        # ``hold_yaw``: straight-line XY only — keep startup heading, do not
+        # command the saved station yaw. Use for counter slides where the
+        # cart is already roughly aligned; holonomic XY+yaw together spins
+        # while translating and often overshoots.
         write_max_vel_scale(
             ctx.redis, HOLONOMIC_BASE_SPEED_SCALE, keys=cfg.base_keys
         )
         holo_cfg = replace(
             cfg,
-            direct_motion=True,
+            direct_motion=not hold_yaw,
             rotate_first=False,
             exit_on_success=True,
             print_plan=False,
         )
-        print(
-            f"[base.go_to_pose] holonomic drive to "
-            f"({final_x:.3f}, {final_y:.3f}) yaw {final_yaw:.1f}\u00b0 "
-            f"(max_vel scale {HOLONOMIC_BASE_SPEED_SCALE:.2f}x baseline)",
-            flush=True,
-        )
+        if hold_yaw:
+            print(
+                f"[base.go_to_pose] straight-line drive to "
+                f"({final_x:.3f}, {final_y:.3f}), holding startup yaw "
+                f"(max_vel scale {HOLONOMIC_BASE_SPEED_SCALE:.2f}x baseline)",
+                flush=True,
+            )
+        else:
+            print(
+                f"[base.go_to_pose] holonomic drive to "
+                f"({final_x:.3f}, {final_y:.3f}) yaw {final_yaw:.1f}\u00b0 "
+                f"(max_vel scale {HOLONOMIC_BASE_SPEED_SCALE:.2f}x baseline)",
+                flush=True,
+            )
         sampler = _begin_phase("holonomic", holo_cfg)
         res = navigate_to_opti_pose(
             ctx.redis,
             target_opti_xy=(final_x, final_y),
-            target_body_yaw_deg=final_yaw,
+            target_body_yaw_deg=None if hold_yaw else final_yaw,
             config=holo_cfg,
             on_sample=sampler,
         )
@@ -350,15 +355,16 @@ def go_to_pose(
     )
 
     # ------------------------------------------------------------------
-    # Phase A: holonomic approach toward (final_x, final_y, final_yaw).
+    # Phase A: straight-line XY approach at the *startup* heading.
     # Exit as soon as XY is within APPROACH_HANDOFF_M of the goal;
-    # yaw is intentionally ignored here (the rotate-in-place phase will
-    # snap it). Implemented by setting tolerance_yaw_rad >= pi so the
-    # opti yaw-error check is always satisfied.
+    # yaw is intentionally ignored here (Phase B snaps heading). Passing
+    # ``target_body_yaw_deg=None`` holds the current heading so the cart
+    # does not holonomically spin while translating — that combined
+    # motion corrupts motion-direction calib and fights Phase B.
     # ------------------------------------------------------------------
     phase_a_cfg = replace(
         cfg,
-        direct_motion=True,
+        direct_motion=False,
         rotate_first=False,
         tolerance_m=APPROACH_HANDOFF_M,
         tolerance_yaw_rad=math.pi,
@@ -366,15 +372,15 @@ def go_to_pose(
         print_plan=False,
     )
     print(
-        f"[base.go_to_pose] Phase A: holonomic approach "
-        f"(exit when XY < {APPROACH_HANDOFF_M * 100:.0f} cm)",
+        f"[base.go_to_pose] Phase A: straight-line approach "
+        f"(hold startup yaw, exit when XY < {APPROACH_HANDOFF_M * 100:.0f} cm)",
         flush=True,
     )
     sampler_a = _begin_phase("phase_a_holonomic", phase_a_cfg)
     res_a = navigate_to_opti_pose(
         ctx.redis,
         target_opti_xy=(final_x, final_y),
-        target_body_yaw_deg=final_yaw,
+        target_body_yaw_deg=None,
         config=phase_a_cfg,
         on_sample=sampler_a,
     )
@@ -395,6 +401,7 @@ def go_to_pose(
         cfg,
         direct_motion=True,
         rotate_first=False,
+        use_motion_direction_calib=False,
         tolerance_m=max(cfg.tolerance_m, APPROACH_HANDOFF_M),
         exit_on_success=True,
         print_plan=False,
