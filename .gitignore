@@ -6,4 +6,9 @@ __pycache__/
 .env
 .env.*
 !.env.example
-.env
+
+# Raw media (processed copies live in docs/assets/)
+
+logs/
+logs2/
+/assets/

@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EggBot — Robotic Chef</title>
+  <meta name="description" content="EggBot: a mobile manipulator that cracks, whisks, and scrambles eggs using vision-guided grasps.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- Academic-paper-style header -->
+  <header class="paper-header">
+    <div class="container">
+      <h1 class="paper-title">EggBot: Vision-Guided Robot for Scrambled Eggs</h1>
+      <p class="paper-authors">Olivia Taylor &middot; Varin Sikka &middot; Vaishnavi Thumuganti &middot; Vakula Venkatesh</p>
+      <p class="paper-affiliation">Stanford CS 225A &middot; Spring 2026</p>
+
+      <nav class="paper-links">
+        <a class="paper-btn dark" href="https://github.com/otaylor2023/EggBot" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
+        </a>
+      </nav>
+    </div>
+
+    <div class="container">
+      <div class="hero-video media-frame">
+        <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata"
+               poster="assets/img/photos/presentation.jpg"
+               src="assets/video/hero/demo.mp4">
+          Your browser does not support the video tag.
+        </video>
+      </div>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- Tasks carousel: 8 tasks across 4 slides (2 / 2 / 2 / 2) -->
+    <section id="tasks" class="full-bleed">
+      <div class="container-wide">
+        <h2 class="section-title">Cooking Pipeline</h2>
+        <p class="section-subtitle">
+          We use eight distinct manipulation tasks, from placing the egg in the cracker to scrambling in the pan.
+          Use the arrows to browse each stage.
+        </p>
+      </div>
+
+      <div class="carousel" aria-label="Cooking tasks carousel">
+        <button class="carousel-btn prev" aria-label="Previous slide">&#8249;</button>
+        <div class="carousel-viewport">
+          <div class="carousel-track">
+
+            <!-- Slide 1: tasks 1-2 -->
+            <div class="carousel-slide">
+              <p class="slide-label">Tasks 1&ndash;2</p>
+              <div class="task-block">
+                <h3>1. Put the egg in the egg cracker</h3>
+                <div class="media-row task-row">
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/01-egg-in-cracker-1.mp4"></video>
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/01-egg-in-cracker-2.mp4"></video>
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/01-egg-in-cracker-3.mp4"></video>
+                </div>
+              </div>
+              <div class="task-block">
+                <h3>2. Crack the egg</h3>
+                <div class="media-row task-row">
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/02-egg-crack-1.mp4"></video>
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/02-egg-crack-2.mp4"></video>
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/02-egg-crack-3.mp4"></video>
+                </div>
+              </div>
+            </div>
+
+            <!-- Slide 2: tasks 3-4 -->
+            <div class="carousel-slide">
+              <p class="slide-label">Tasks 3&ndash;4</p>
+              <div class="task-block">
+                <h3>3. Pour out the empty eggshell</h3>
+                <div class="media-row task-row two">
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/03-shell-1.mp4"></video>
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/03-shell-2.mp4"></video>
+                </div>
+              </div>
+              <div class="task-block">
+                <h3>4. Whisk the egg</h3>
+                <div class="media-row task-row two">
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/04-whisk-1.mp4"></video>
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/04-whisk-2.mp4"></video>
+                </div>
+              </div>
+            </div>
+
+            <!-- Slide 3: tasks 5-6 -->
+            <div class="carousel-slide">
+              <p class="slide-label">Tasks 5&ndash;6</p>
+              <div class="task-block">
+                <h3>5. Pour the egg mixture into the pan</h3>
+                <div class="media-row task-row two">
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/05-pour-1.mp4"></video>
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/05-pour-2.mp4"></video>
+                </div>
+              </div>
+              <div class="task-block">
+                <h3>6. Move the pan to the back burner</h3>
+                <div class="media-row task-row two">
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/06-pan-move-1.mp4"></video>
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/06-pan-move-2.mp4"></video>
+                </div>
+              </div>
+            </div>
+
+            <!-- Slide 4: tasks 7-8 -->
+            <div class="carousel-slide">
+              <p class="slide-label">Tasks 7&ndash;8</p>
+              <div class="task-block">
+                <h3>7. Pick up the ladle</h3>
+                <div class="media-row task-row two">
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/07-ladle-1.mp4"></video>
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/07-ladle-2.mp4"></video>
+                </div>
+              </div>
+              <div class="task-block">
+                <h3>8. Scramble the eggs</h3>
+                <div class="media-row task-row two">
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/08-scramble-1.mp4"></video>
+                  <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/tasks/08-scramble-2.mp4"></video>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+        <button class="carousel-btn next" aria-label="Next slide">&#8250;</button>
+        <div class="carousel-dots"></div>
+      </div>
+    </section>
+
+    <!-- Gemini grasps -->
+    <section id="grasps">
+      <div class="container">
+        <h2 class="section-title">Vision-Guided Grasping</h2>
+        <div class="section-lead">
+          <p>
+            We use <strong>Gemini Embodied Reasoning 1.6</strong> to figure out where to grab our objects.
+            For each RGB-D frame from the wrist camera, Gemini marks one or several 2D grasp points on the relevant object. We look up that pixel's depth, then run it through the
+            camera &rarr; end-effector &rarr; world transform to get the actual 3D grasp pose for the arm.
+          </p>
+          <p>
+            The arm runs on a task-space Cartesian controller, and we tune its gains and speeds per task.
+            Precise grasps like the egg cracker and tongs need about <strong>0.5 cm</strong> of accuracy,
+            so we raise the gains and lower the max velocity; for carrying and pouring we loosen the gains and
+            move faster. A few motions &mdash; mainly shaking, came out cleaner
+            in <strong>joint space</strong>, so we command those joints directly instead of through a
+            Cartesian goal.
+          </p>
+          <p>
+            We determined grasp pose differently depending on the object:
+          </p>
+        </div>
+
+        <div class="grasps-grid">
+          <article class="grasp-card">
+            <div class="media-frame grasp-media">
+              <img src="assets/img/grasps/perpendicular.png" alt="Perpendicular grasp on the pan handle" loading="lazy">
+            </div>
+            <h3>Perpendicular Grasp</h3>
+            <p>
+              On the pan handle, the gripper closes <em>perpendicular</em> to the handle. Gemini gives us
+              both the grasp point and the handle's orientation, so the jaws line up across it for a
+              solid hold while moving the pan.
+            </p>
+          </article>
+          <article class="grasp-card">
+            <div class="media-frame grasp-media">
+              <img src="assets/img/grasps/parallel.png" alt="Parallel grasp on the egg cracker" loading="lazy">
+            </div>
+            <h3>Parallel Grasp</h3>
+            <p>
+              The egg cracker is picked up with the jaws running <em>parallel</em> to its handle, which
+              lets the gripper squeeze straight down the cracking axis when it's time to crack the egg.
+            </p>
+          </article>
+          <article class="grasp-card">
+            <div class="media-frame grasp-media">
+              <img src="assets/img/grasps/bowl.png" alt="Bowl grasp on the mixing bowl rim" loading="lazy">
+            </div>
+            <h3>Bowl Grasp</h3>
+            <p>
+              For the bowl, we ask Gemini for <em>two</em> points along the near rim instead of one. We
+              lift both into 3D, use the first as the grasp position, and take the line between them as
+              the rim's direction. We project that line onto the table plane and use its angle to spin
+              the gripper about the vertical axis, so the jaws line up across the rim before pinching and
+              pouring.
+            </p>
+          </article>
+          <article class="grasp-card">
+            <div class="media-frame grasp-media">
+              <img src="assets/img/grasps/egg-tongs.png" alt="Grasping the egg held in the tongs" loading="lazy">
+            </div>
+            <h3>Egg Grasp  with Tongs</h3>
+            <p>
+              For the egg we use a single point. Gemini marks the egg, we read the depth around that
+              pixel and back-project it into 3D. We determine the angle to orient the tongs and the offset the gripper should have based on the tool length. The gripper stays pointing straight down and closes the tongs
+              around the egg at that spot.
+            </p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- Force control -->
+    <section id="force">
+      <div class="container">
+        <h2 class="section-title">Force Control</h2>
+        <div class="section-lead">
+          <p>
+            We use force control in a few key spots to handle tools and food without breaking them.
+            Here are the three main use cases:
+          </p>
+        </div>
+
+        <div class="force-grid">
+          <article class="info-card">
+            <div class="media-frame force-media">
+              <img src="assets/img/photos/force-tongs.jpg" alt="Picking up the egg with tongs" loading="lazy">
+            </div>
+            <h3>Egg &mdash; handled with tongs</h3>
+            <p>
+              The Franka Hand's grasping force runs from <strong>30 N</strong> to <strong>140 N</strong>,
+              but an egg cracks around <strong>20 N</strong> &mdash; below what the gripper can distinguish.
+              So we pick the egg up with tongs, which due to mechanical advantage, allows the gripper to use more force while exerting less on the egg to keep it from breaking.
+            </p>
+          </article>
+          <article class="info-card">
+            <div class="media-frame force-media">
+              <img src="assets/img/photos/force-cracker.jpg" alt="Egg cracker squeezed, egg dropping into the bowl" loading="lazy">
+            </div>
+            <h3>Egg cracker &mdash; squeeze to crack</h3>
+            <p>
+              We grab the cracker gently, then ramp up to max force over <strong>three squeezes</strong>
+              to break the shell, and release so the shell falls open and the egg drops into the bowl.
+            </p>
+          </article>
+          <article class="info-card">
+            <div class="media-frame force-media">
+              <img src="assets/img/photos/force-whisk.jpg" alt="Whisk activated in the bowl" loading="lazy">
+            </div>
+            <h3>Whisk &mdash; squeeze to activate</h3>
+            <p>
+              The whisk has a force-controlled button to activate it, and different levels of presses control the speed. At first, we have the robot hold it lightly but firmly to avoid accidental triggers, then squeeze when inside the egg mixture to turn it on, and finally loosen it to stop it
+              before setting it back down.
+            </p>
+          </article>
+        </div>
+
+        <div class="section-lead closing">
+          <p>
+            Tuning these grip forces took a lot of trial and error, especially since the robot only has
+            one gripper to work with and has to use each tool on its own.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Hardware -->
+    <section id="hardware">
+      <div class="container">
+        <h2 class="section-title">Hardware</h2>
+        <div class="hardware-grid">
+          <div class="media-frame hardware-media">
+            <img src="assets/img/photos/hardware.jpg" alt="EggBot hardware: Franka arm on TidyBot base at the stove" loading="lazy">
+          </div>
+          <div class="hardware-text">
+            <ul class="spec-list">
+              <li><span class="spec-key">Arm</span> Franka Emika Panda / FR3 7-DoF manipulator</li>
+              <li><span class="spec-key">End effector</span> Franka Hand parallel-jaw gripper</li>
+              <li><span class="spec-key">Mobile base</span> TidyBot holonomic base</li>
+              <li><span class="spec-key">Camera</span> Intel RealSense D405 (wrist-mounted RGB-D)</li>
+            </ul>
+            <p>
+              The Franka arm rides on a TidyBot base so EggBot can reposition between the ingredient
+              area and stovetop. The wrist-mounted RealSense D405 provides the aligned RGB-D stream
+              that feeds Gemini for grasp identification.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Simulation -->
+    <section id="simulation">
+      <div class="container">
+        <h2 class="section-title">From Simulation to Real</h2>
+        <p class="section-subtitle">
+          We started out building the state machine and motions in the <strong>OpenSai</strong>
+          simulator, but moved to the real robot fairly quickly, as the physics around eggs and our specialized tools weren't worth trying to model in sim.
+        </p>
+        <div class="media-row sim-row">
+          <div class="media-frame sim-media">
+            <img src="assets/img/photos/state-machine.png" alt="EggBot task state machine" loading="lazy">
+          </div>
+          <div class="media-frame sim-media">
+            <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/sim/sim.mp4"></video>
+          </div>
+        </div>
+        <p class="media-caption">State machine (left) and the OpenSai simulation environment (right).</p>
+      </div>
+    </section>
+
+    <!-- Taste tests -->
+    <section id="taste">
+      <div class="container">
+        <h2 class="section-title">Taste Tests</h2>
+        <p class="section-subtitle">
+          The real test: did the robot actually make eggs people would eat?
+        </p>
+
+        <div class="media-row taste-row">
+          <div class="media-item">
+            <div class="media-frame taste-media">
+              <video src="assets/video/taste/olivia.mp4" controls playsinline loop preload="metadata"></video>
+            </div>
+            <p class="media-caption">Olivia (team member) tries the eggs</p>
+          </div>
+          <div class="media-item">
+            <div class="media-frame taste-media">
+              <video src="assets/video/taste/william.mp4" controls playsinline loop preload="metadata"></video>
+            </div>
+            <p class="media-caption">William's (TA) taste test</p>
+          </div>
+          <div class="media-item">
+            <div class="media-frame taste-media">
+              <img src="assets/img/photos/adrian-eggs.jpg" alt="Adrian greedily taking the rest of the eggs" loading="lazy">
+            </div>
+            <p class="media-caption">Adrian (TA) greedily taking the rest of the eggs</p>
+          </div>
+        </div>
+
+        <h3 class="subsection-title">Testimonials</h3>
+        <div class="testimonials-grid">
+          <blockquote class="testimonial">&ldquo;Actually pretty good&rdquo;</blockquote>
+          <blockquote class="testimonial">&ldquo;Edible&rdquo;</blockquote>
+          <blockquote class="testimonial">
+            <span>Child: &ldquo;These are really good!&rdquo;</span>
+            <span>Mom: &ldquo;Better than mine?&rdquo;</span>
+            <span>Child: &ldquo;Yeah!!&rdquo;</span>
+          </blockquote>
+          <blockquote class="testimonial">&ldquo;Wow these are really good!&rdquo;</blockquote>
+        </div>
+      </div>
+    </section>
+
+    <!-- Demo -->
+    <section id="demo">
+      <div class="container">
+        <h2 class="section-title">Demo &amp; Presentation</h2>
+        <p class="section-subtitle">
+          The demo run, our final presentation, and our team.
+        </p>
+
+        <div class="media-row demo-row demo-top">
+          <div class="media-frame demo-media demo-portrait">
+            <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/demo/portrait.mp4"></video>
+          </div>
+          <div class="media-frame demo-media">
+            <img src="assets/img/photos/presentation.jpg" alt="EggBot presentation" loading="lazy">
+          </div>
+        </div>
+        <div class="media-row demo-row demo-team">
+          <div class="media-frame demo-media">
+            <img src="assets/img/photos/team-1.jpg" alt="EggBot team photo" loading="lazy">
+          </div>
+          <div class="media-frame demo-media">
+            <img src="assets/img/photos/team-2.jpg" alt="EggBot team photo" loading="lazy">
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Challenges -->
+    <section id="challenges">
+      <div class="container">
+        <h2 class="section-title">Challenges</h2>
+        <div class="section-lead">
+          <p>
+            <strong>Switching from baked ziti to eggs.</strong> We originally set out to make baked ziti, but that
+            pipeline turned out to too long. We narrowed down to eggs, which were already part of
+            the ziti pipeline, and reused most of the same primitives to get a more interactive (and
+            tastier) demo.
+          </p>
+          <p>
+            <strong>Talking to the arm.</strong> The link between the onboard computer and the arm was
+            sometimes flaky and would drop out mid-task, which sometimes made the arm move unpredictably.
+          </p>
+          <p>
+            <strong>Eggs are unreliable.</strong> No two eggs crack the same way, so we built in some
+            redundancy such as several squeezes to crack and various hakes to knock the shell loose so that
+            stubborn eggs wouldn't break the whole run (but they sometimes did anyway).
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Bloopers -->
+    <section id="bloopers">
+      <div class="container">
+        <h2 class="section-title">Bloopers</h2>
+        <p class="section-subtitle"><i>You can't make an omelette without breaking a few eggs!</i></p>
+
+        <div class="media-row blooper-row">
+          <div class="media-item">
+            <div class="media-frame blooper-media">
+              <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/bloopers/egg-crack-swing.mp4"></video>
+            </div>
+            <p class="media-caption">The robot gives up</p>
+          </div>
+          <div class="media-item">
+            <div class="media-frame blooper-media">
+              <video class="click-to-control autoplay-inview" playsinline muted loop preload="metadata" data-src="assets/video/bloopers/egg-drop.mp4"></video>
+            </div>
+            <p class="media-caption">Vision mistake...</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    <div class="container">
+      <h2 class="footer-title">Acknowledgements</h2>
+
+      <p>
+        Huge thanks to the CS 225A teaching team: Oussama Khatib, Xiyang Yeh, Enzo Andreacchi, Adrian Piedra,
+        and especiallly our project mentor,
+        <strong>William Chong.</strong>
+      </p>
+      <br>
+      <p>
+        Additionally, we'd like to thank the <strong>Stanford Robotics Center</strong>, and especially SRC lab manager
+        <strong>Zen Yaskawa</strong>, for letting us use the space and for being so helpful throughout
+        the project.
+      </p>
+      <p class="footer-sub">CS 225A Final Project &mdash; Stanford University. Website made by Olivia Taylor.</p>
+    </div>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>

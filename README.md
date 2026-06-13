@@ -1,156 +1,224 @@
-# ZitiBot: Robotic Chef for Baked Ziti
+# EggBot: A Robot That Cooks Scrambled Eggs
 
-Final project for **CS225A**: a **mobile manipulator** (differential-drive base and **Franka Panda** arm) programmed to cook **baked ziti!** The same controller and visualizer are used in **simulation** and can be deployed on the **physical robot** when wired to the Redis interface and hardware drivers.
+Final project for **CS 225A** (Stanford). EggBot is a **mobile manipulator** — a
+**Franka Emika Panda / FR3** arm with a **Franka Hand** gripper riding on a **TidyBot**
+holonomic base — that cooks scrambled eggs end-to-end: it grabs an egg, cracks it,
+clears the shell, repeats for a second egg, whisks, pours into a pan, moves the pan
+to the stove, picks up a ladle, and scrambles.
 
-This repository is a **standalone** CMake project. It depends on the same **OpenSai / SAI** libraries (CHAI3D, Redis, SaiModel, SaiSimulation, SaiGraphics, SaiPrimitives, etc.) as the course stack; install those per course instructions before building.
+The project started in the **OpenSai** simulator and moved to the real robot. Grasps
+are chosen on-line with **Gemini Robotics-ER 1.6**; motion runs through OpenSai's
+task-space Cartesian controller over Redis.
 
-## URDF assets
+Project website: see **`docs/`** or the published
+[GitHub Pages site](https://otaylor2023.github.io/EggBot/).
 
-Robot and world files live under **`urdf_models/`** at the **ZitiBot** repo root (`mmp_panda/`, `panda/`, `test_objects/`). That is the supported layout for this standalone project (no dependency on `cs225a/urdf_models` at runtime). CMake defaults to this folder; to use another tree, configure with:
+---
 
-```bash
-cmake -S . -B build -DURDF_MODELS_FOLDER=/absolute/path/to/urdf_models
+## Where this lives inside OpenSai
+
+This repo is meant to be checked out **as a subfolder of an OpenSai tree**:
+
+```
+OpenSai/
+├── bin/OpenSai_main                       # OpenSai sim/controller binary
+├── config_folder/xml_config_files/
+│   └── zitibot_panda.xml                   # robot + cartesian_controller config
+├── drivers/FrankaPanda/redis_driver/       # Franka arm + gripper Redis drivers
+├── scripts/launch.sh                       # OpenSai launcher
+└── ZitiBot/                                # ← this repo
+    ├── controllers/                        # Python real-robot controllers (Redis)
+    ├── zitibot_mmp_panda/                  # standalone C++ sim (sim-only FSM)
+    ├── urdf_models/                        # robot + world URDFs
+    ├── docs/                               # project website (GitHub Pages)
+    └── launch_zitibot_*.sh                 # orchestration scripts
 ```
 
-## Build
+The launch scripts resolve `REPO_ROOT` as the **parent** of `ZitiBot/` (i.e. the OpenSai
+root) and expect `bin/OpenSai_main`, the `zitibot_panda.xml` config, and the Franka
+drivers to exist there. The Python controllers talk to whatever OpenSai publishes on
+Redis, so they are agnostic to sim vs. real as long as the keys are populated.
+
+All OpenSai/SAI dependencies (CHAI3D, Redis, SaiModel, SaiSimulation, SaiGraphics,
+SaiPrimitives, Eigen) come from the course stack — install those per course instructions
+before building anything here.
+
+---
+
+## Quick start (real robot)
 
 ```bash
+# 1. Start OpenSai (arm + cartesian_controller), the Franka gripper driver,
+#    and the TidyBot base driver, then a Python controller:
+./launch_zitibot_full.sh controllers/grasp_and_pour_controller.py
+
+# arm only (no mobile base), e.g. for bench testing:
+./launch_zitibot_arm.sh controllers/egg_crack_controller.py
+```
+
+- `--wait` holds the controller until you press SPACE.
+- `--no-base` / `--no-gripper` skip those drivers.
+- Anything after `--` is forwarded to the Python controller:
+  `./launch_zitibot_full.sh controllers/pour_and_move_controller.py -- --grasp-opti-x -2.52`
+
+Prerequisites the scripts assume: `bin/OpenSai_main` built, the Franka gripper driver
+built under `drivers/FrankaPanda/redis_driver/`, OptiTrack/Motive publishing
+`tidybot01::*` to Redis (run separately), and **Redis running**.
+
+---
+
+## Control architecture
+
+Motion is a **task-space Cartesian controller** owned by OpenSai. Python controllers
+write goals to Redis under the `cartesian_controller::cartesian_task` namespace:
+
+```
+opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::goal_position
+opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::goal_orientation
+opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_position
+opensai::controllers::FrankaRobot::cartesian_controller::cartesian_task::current_orientation
+```
+
+Design notes:
+
+- **Per-task gains/speeds.** Precise grasps (egg cracker, tongs; ~0.5 cm tolerance) run
+  with higher gains and lower speeds; carrying/pouring loosens gains and moves faster.
+- **Joint space for shaking.** The vigorous shake/scramble motions are commanded directly
+  in joint space — cleaner, more repeatable oscillations than chasing a Cartesian goal.
+- **Gated state machines.** The interactive real-robot controllers (e.g.
+  `egg_crack_controller.py`) advance one phase per **ENTER** press
+  (`ABOVE_PICK → AT_PICK → GRASPED → LIFTED → SQUEEZED → ABOVE_DROP → AT_DROP → DONE`),
+  which made debugging on hardware safe.
+
+### Python controllers (`controllers/`)
+
+| File | Role |
+|------|------|
+| `vision_controller_new.py` | Live RealSense + Gemini overlay; SPACE = query Gemini & latch a grasp, ENTER = publish the Cartesian goal. Current vision entry point. |
+| `grasp_and_pour_controller.py` | Interactive grasp → close → lift → pour (90° about world +Y). |
+| `grasp_pour_vision_base_controller.py` | Grasp-and-pour with the TidyBot base in the loop. |
+| `egg_crack_controller.py` | Arm + gripper egg-cracker sequence with the force schedule below. |
+| `pour_and_move_controller.py`, `mixing_*`, `stirring_controller.py` | Per-primitive motions reused across the pipeline. |
+| `gemini_image_cli.py` | Run Gemini on a single saved image (2D keypoints only — no camera, no Redis). |
+| `tidybot_base/` | TidyBot holonomic base: Redis driver, SE(2) planning, OptiTrack mocap nav. |
+
+---
+
+## Vision-guided grasping
+
+We use **Gemini Robotics-ER 1.6** (`gemini-robotics-er-1.6-preview`) to pick grasp points
+from the wrist-mounted **RealSense D405** RGB-D stream. The geometry/library code (no
+Redis, no robot) lives in **`controllers/vision/gemini_pointing.py`**:
+
+1. Send the RGB frame + a prompt to Gemini; parse the JSON keypoint(s) it returns
+   (`parse_points`).
+2. Sample depth at each pixel as a **median over a small patch** so a few bad depth
+   readings don't throw it off (`sample_depth_median`).
+3. Back-project pixel + depth into the camera frame with the RealSense intrinsics
+   (`deproject_pixel_to_cam` / `lift_points_to_3d`).
+
+The controller then chains the transform to world frame:
+
+```
+p_base = T_base_flange · T_flange_camera · p_camera
+```
+
+Two grasp strategies:
+
+- **Single-point grasps (egg, tools).** Gemini marks one point; the gripper stays
+  tool-down and closes at that 3D position. Used for picking up the egg with tongs.
+- **Two-point rim grasps (bowl).** Gemini returns *two* rim points. Both are lifted to
+  3D; the first is the grasp position, and the vector between them is projected onto the
+  table plane. Its yaw (`rim_yaw_rotation_rad` → `arctan2`) is applied as a world-Z
+  rotation so the jaws line up across the rim before pinching and pouring.
+
+### Camera utilities
+
+```bash
+python controllers/vision/test_camera.py            # color + depth side by side
+python controllers/vision/grasp_demo.py             # GG-CNN2 / GR-ConvNet heatmap grasps (legacy)
+```
+
+`grasp_demo.py` bundles two pretrained heatmap grasp nets (GG-CNN2 depth-only and
+GR-ConvNet v3 RGB-D) selectable with `--model`; download their Cornell weights via the
+`weights/download_weights.sh` scripts under `controllers/vision/ggcnn|grconvnet`.
+
+---
+
+## Force control
+
+The Franka Hand's grasping force runs from about **30 N to 140 N**, but a raw egg fractures
+near **20 N** — below what the gripper can reliably command. So:
+
+- **Egg:** picked up with **tongs**, whose compliant arms spread the contact force enough
+  to lift the egg intact.
+- **Egg cracker:** grasped at low force, then ramped toward max over **three consecutive
+  squeezes** to break the shell, then released so the shell halves fall into the bowl. See
+  the `LIFTED → SQUEEZED` phase and the `lift_force_n` / `crack_force_n` /
+  `crack_unlatch_m` parameters in `egg_crack_controller.py`.
+- **Whisk:** held lightly but firmly, squeezed to switch its mechanism on, loosened to
+  stop.
+
+---
+
+## Simulation (OpenSai)
+
+The sim-only prototype is a **standalone CMake C++ project** under `zitibot_mmp_panda/`
+(`controller.cpp`, `simviz.cpp`, `world_mmp_panda.urdf`). It links the same SAI libraries
+as the course stack.
+
+```bash
+# configure + build the two executables
+./build_zitibot.sh
+# or directly:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4) \
-  --target controller_zitibot_mmp_panda simviz_zitibot_mmp_panda
+cmake --build build -j --target controller_zitibot_mmp_panda simviz_zitibot_mmp_panda
 ```
 
-Or use the helper script from the repo root:
+URDFs default to `urdf_models/` at the repo root; override with
+`-DURDF_MODELS_FOLDER=/abs/path`. Redis must be running before launching. Run the built
+binaries (`simviz_zitibot_mmp_panda` for the visualizer, `controller_zitibot_mmp_panda`
+for the sim FSM) from `bin/`. On hardware, use `launch_zitibot_full.sh` /
+`launch_zitibot_arm.sh` with the Python controllers instead.
 
-```bash
-./build_zitibot.sh              # configure + build the two executables
-./build_zitibot.sh --all        # build every target in this project
-```
+---
 
-Optional environment: **`JOBS`**, **`CMAKE_BUILD_TYPE`**.
-
-Binaries: **`bin/zitibot_mmp_example/simviz_zitibot_mmp_panda`** and **`controller_zitibot_mmp_panda`**.
-
-**Redis** must be running before starting the sim or controller.
-
-## Launch
-
-```bash
-./launch_zitibot.sh           # visualizer + controller (no build step)
-./launch_zitibot.sh --wait    # wait for SPACE before starting the controller
-./launch_zitibot.sh --build   # configure + build, then launch
-```
-
-- **Ctrl+C** in the terminal stops the visualizer and controller.
-- **Q** with keyboard focus in the **graphics window** closes the visualizer; the script stops the controller and exits.
-
-`./launch_zitibot.sh --help` lists options.
-
-## Vision
-
-Python utilities for the onboard Intel RealSense camera live under **`python_control/vision/`** (library code used by scripts in **`python_control/`**).
-
-Install Python deps (works in a venv or conda env):
+## Python setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Note: `pyrealsense2` ships prebuilt wheels for Linux x86_64 and Windows. On macOS / Linux ARM you'll need to build `librealsense` from source.
+`pyrealsense2` ships prebuilt wheels for Linux x86_64 / Windows; on macOS or Linux ARM
+build `librealsense` from source.
 
-### Stream the camera
-
-```bash
-python python_control/vision/test_camera.py                # color + depth side by side
-python python_control/vision/test_camera.py --no-depth     # color only
-python python_control/vision/test_camera.py --fps 15       # drop fps if USB bandwidth is tight
-```
-
-`q` or `Esc` to quit.
-
-### Grasp demo (parallel-jaw / 2-finger gripper)
-
-`python_control/vision/grasp_demo.py` streams the RealSense and, on SPACE, runs a heatmap grasp predictor on the current RGB-D frame. Two pretrained models are bundled, selected with `--model`:
-
-| `--model` | Network | Input | Default size | Source |
-|-----------|---------|-------|--------------|--------|
-| `ggcnn2` (default) | GG-CNN2 (Morrison et al., RSS 2018) | depth only | 300×300 | [dougsm/ggcnn](https://github.com/dougsm/ggcnn) |
-| `grconvnet` | GR-ConvNet v3 (Kumra et al., IROS 2020) | RGB-D | 224×224 | [skumra/robotic-grasping](https://github.com/skumra/robotic-grasping) |
-
-Both are single-pass heatmap networks and run real-time on CPU. GR-ConvNet is heavier and a bit stronger on Cornell; GG-CNN2 is tiny.
-
-One-time: fetch whichever model's pretrained Cornell weights you want.
-
-```bash
-bash python_control/vision/ggcnn/weights/download_weights.sh        # ~1 MB
-bash python_control/vision/grconvnet/weights/download_weights.sh    # ~30 MB
-```
-
-Run:
-
-```bash
-python python_control/vision/grasp_demo.py                          # ggcnn2 (default)
-python python_control/vision/grasp_demo.py --model grconvnet
-python python_control/vision/grasp_demo.py --model grconvnet --crop 400 --fps 15
-```
-
-Keys:
-
-- **SPACE** -- run the selected model on the current frame; pop a window with a jet-colormapped quality heatmap and the top antipodal grasp (red = gripper plates, green = opening width).
-- **s** -- save the latched grasp overlay as `grasp_<model>_<timestamp>.png` in the cwd.
-- **q** / **Esc** -- quit.
-
-### Gemini ER pointing + robot (OpenSai Redis)
-
-**`python_control/vision_controller.py`** runs the live RealSense + **Gemini Robotics-ER** overlay, then on **ENTER** writes OpenSai Franka **cartesian_task** goal position/orientation to Redis (same JSON keys as `python_control/touch_controller.py`). **SPACE** queries Gemini; **s** saves the overlay; **q** / **Esc** quits.
-
-For a **single saved image** (2D keypoints only, no camera, no Redis), use:
-
-```bash
-python python_control/gemini_image_cli.py --image path/to/scene.jpg
-```
-
-Gemini/geometry helpers live under **`python_control/vision/gemini_pointing.py`** (library only — no Redis).
-
-Install (covers `google-genai` and the optional `python-dotenv` auto-loader):
-
-```bash
-pip install -r requirements.txt
-```
-
-Get an API key from [Google AI Studio](https://aistudio.google.com/) and put it in a `.env` file at the repo root — the library auto-loads it on every run (`.env` is gitignored):
+Gemini needs an API key from [Google AI Studio](https://aistudio.google.com/). Put it in a
+`.env` at the repo root — it's auto-loaded on every run and is gitignored:
 
 ```bash
 echo 'GEMINI_API_KEY=your-key-here' > .env
 ```
 
-A real `GEMINI_API_KEY` / `GOOGLE_API_KEY` environment variable also works if you prefer.
+A `GEMINI_API_KEY` / `GOOGLE_API_KEY` environment variable works too.
 
-Live camera + robot goals (from the OpenSai / ZitiBot repo root):
+---
 
-```bash
-python python_control/vision_controller.py
-python python_control/vision_controller.py --object "pasta pot"
-python python_control/vision_controller.py --prompt "Point to the rim of the bowl."
-```
+## Project website (`docs/`)
 
-Keys (live): **SPACE** = query Gemini, **ENTER** = send cartesian goal, **s** = save overlay, **q** / **Esc** = quit.
-
-### Grasp and pour (Gemini + Franka gripper)
-
-**`ZitiBot/controllers/grasp_and_pour_controller.py`** is the interactive real-robot flow (no mobile base): same Gemini + RealSense UI as `vision_controller.py`, but **ENTER** is two-step — first descend to the latched pick with gripper **open**, then **close**, **lift**, and **pour** (90° about world +Y, ported from `zitibot_mmp_panda/controller.cpp`).
-
-Prerequisites:
-
-- Redis, OpenSai web UI on **`zitibot_panda.xml`**, **`cartesian_controller`** active
-- Franka arm Redis driver and Franka **gripper** driver (`opensai::FrankaRobot::gripper::desired_width`, etc.)
-- RealSense + `GEMINI_API_KEY` (see above)
+The site is published with GitHub Pages from the **`docs/`** folder
+(**Settings → Pages → Deploy from a branch → `main` / `/docs`**).
 
 ```bash
-python ZitiBot/controllers/grasp_and_pour_controller.py
-python ZitiBot/controllers/grasp_and_pour_controller.py --lift-dz 0.12 --object bowl
+# local preview
+python3 -m http.server 8080 --directory docs   # http://localhost:8080
 ```
 
-Keys: **SPACE** = Gemini + latch pick | **ENTER** = grasp (open) then lift+pour | **s** = save overlay | **q** / **Esc** = quit.
+Media in `docs/assets/` is transcoded (H.264, mostly audio-stripped) from raw clips in
+`assets/edited_videos/` (gitignored). Rebuild after swapping clips:
 
-The sim auto-FSM remains **`launch_zitibot.sh`** / `controller_zitibot_mmp_panda` (C++); use this script on hardware with OpenSai.
+```bash
+bash scripts/build_site_media.sh               # requires ffmpeg
+```
+
+Grasp overlays are copied from `logs2/` by default; override with
+`ZITIBOT_LOGS=/path/to/logs`.
